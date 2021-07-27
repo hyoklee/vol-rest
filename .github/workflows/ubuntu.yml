@@ -1,0 +1,21 @@
+name: test h5 develop
+
+on:
+  push:
+    branches: [ hdf5_1_12_udpate ]
+  pull_request:
+    branches: [ hdf5_1_12_udpate ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Install dependencies
+      run: sudo apt-get install ninja-build yajl
+
+    - name: Checkout source
+      uses: actions/checkout@v2
+
+    - name: Run CMake
+      run: ./build_vol_cmake.sh
