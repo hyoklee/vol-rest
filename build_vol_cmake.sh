@@ -1,20 +1,16 @@
 #!/bin/sh
 #
-# Copyright by The HDF Group.                                              
-# All rights reserved.                                                     
+# Copyright by The HDF Group.
+# All rights reserved.
 #
-# This file is part of HDF5. The full HDF5 copyright notice, including     
-# terms governing use, modification, and redistribution, is contained in   
-# the files COPYING and Copyright.html.  COPYING can be found at the root  
-# of the source code distribution tree; Copyright.html can be found at the 
-# root level of an installed copy of the electronic document set and is    
-# linked from the top-level documents page.  It can also be found at       
-# http://hdfgroup.org/HDF5/doc/Copyright.html.  If you do not have access  
-# to either file, you may request a copy from help@hdfgroup.org.           
+# This file is part of the HDF5 REST VOL connector. The full copyright
+# notice, including terms governing use, modification, and redistribution,
+# is contained in the COPYING file, which can be found at the root of the
+# source code distribution tree.
 #
 # A script used to first configure and build the HDF5 source distribution
-# included with the REST VOL plugin source code, and then use that built
-# HDF5 to build the REST VOL plugin itself.
+# included with the REST VOL connector source code, and then use that built
+# HDF5 to build the REST VOL connector itself.
 
 # Get the directory of the script itself
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
@@ -32,28 +28,18 @@ CMAKE_GENERATOR="Unix Makefiles"
 # building in parallel with Autotools make
 NPROCS=0
 
-# Default is to not build tools due to circular dependency on VOL being
-# already built
-build_tools=false
-
-# Compiler flags for linking with cURL and YAJL
-CURL_DIR=""
-CURL_LINK="-lcurl"
-YAJL_DIR=""
-YAJL_LINK="-lyajl"
-
-# Compiler flag for linking with the built REST VOL
-REST_VOL_LINK="-lrestvol"
-
 # Extra compiler options passed to the various steps, such as -Wall
 COMP_OPTS="-Wall -pedantic -Wunused-macros"
 
 # Extra options passed to the REST VOLs CMake script
-PLUGIN_DEBUG_OPT=
+CONNECTOR_DEBUG_OPT=
 CURL_DEBUG_OPT=
 MEM_TRACK_OPT=
-PREBUILT_HDF5_OPT=
-
+THREAD_SAFE_OPT=
+HDF5_INSTALL_DIR=
+CURL_OPT=
+YAJL_OPT=
+YAJL_LIB_OPT=
 
 echo
 echo "*************************"
@@ -73,11 +59,11 @@ usage()
     echo
     echo "      -m      Enable memory tracking in the REST VOL."
     echo
-    echo "      -t      Build the tools with REST VOL support. Note"
-    echo "              that due to a circular build dependency, this"
-    echo "              option should not be chosen until after the"
-    echo "              included HDF5 source distribution and the"
-    echo "              REST VOL plugin have been built once."
+    echo "      -s      Enable linking to thread safe static hdf5 library."
+    echo
+    echo "      -t      Make use of the static YAJL library. Be aware the"
+    echo "              library should be built with position independent"
+    echo "              code option enabled."
     echo
     echo "      -G      Specify the CMake Generator to use for the build"
     echo "              files created. Default is 'Unix Makefiles'."
@@ -87,7 +73,7 @@ usage()
     echo "              is 'source directory/rest_vol_build'."
     echo
     echo "      -H DIR  To specify a directory where HDF5 has already"
-    echo "              been built."
+    echo "              been installed."
     echo
     echo "      -B DIR  Specifies the directory that CMake should use as"
     echo "              the build tree location. Default is"
@@ -97,15 +83,15 @@ usage()
     echo
     echo "      -C DIR  To specify the top-level directory where cURL is"
     echo "              installed, if cURL was not installed to a system"
-    echo "              directory."
+    echo "              directory. Similar to '-DCURL_ROOT=DIR'."
     echo
     echo "      -Y DIR  To specify the top-level directory where YAJL is"
     echo "              installed, if YAJL was not installed to a system"
-    echo "              directory."
+    echo "              directory. Similar to '-DYAJL_ROOT=DIR'."
     echo
 }
 
-optspec=":hctdmG:H:C:Y:B:P:-"
+optspec=":hctdmstlG:H:C:Y:B:P:-"
 while getopts "$optspec" optchar; do
     case "${optchar}" in
     h)
@@ -113,23 +99,27 @@ while getopts "$optspec" optchar; do
         exit 0
         ;;
     d)
-        PLUGIN_DEBUG_OPT="-DREST_VOL_ENABLE_DEBUG=ON"
-        echo "Enabled plugin debugging"
+        CONNECTOR_DEBUG_OPT="-DHDF5_VOL_REST_ENABLE_DEBUG=ON"
+        echo "Enabled connector debugging"
         echo
         ;;
     c)
-        CURL_DEBUG_OPT="-DREST_VOL_ENABLE_CURL_DEBUG=ON"
+        CURL_DEBUG_OPT="-DHDF5_VOL_REST_ENABLE_CURL_DEBUG=ON"
         echo "Enabled cURL debugging"
         echo
         ;;
     m)
-        MEM_TRACK_OPT="-DREST_VOL_ENABLE_MEM_TRACKING=ON"
-        echo "Enabled plugin memory tracking"
+        MEM_TRACK_OPT="-DHDF5_VOL_REST_ENABLE_MEM_TRACKING=ON"
+        echo "Enabled connector memory tracking"
         echo
         ;;
-    t)
-        build_tools=true
-        echo "Building tools with REST VOL support"
+    s)
+        THREAD_SAFE_OPT="-DHDF5_VOL_REST_THREAD_SAFE=ON"
+        echo "Enabled linking to static thread safe hdf5 library"
+        echo
+        ;;
+    t)  YAJL_LIB_OPT="-DYAJL_USE_STATIC_LIBRARIES=ON"
+        echo "Use the static YAJL library."
         echo
         ;;
     G)
@@ -148,22 +138,18 @@ while getopts "$optspec" optchar; do
         echo
         ;;
     H)
-        PREBUILT_HDF5_OPT="-DPREBUILT_HDF5_DIR=$OPTARG"
+        HDF5_INSTALL_DIR="$OPTARG"
         echo "Set HDF5 install directory to: $OPTARG"
         echo
         ;;
     C)
-        CURL_DIR="$OPTARG"
-        CURL_LINK="-L${CURL_DIR}/lib ${CURL_LINK}"
-        CMAKE_OPTS="--with-curl=${CURL_DIR} ${CMAKE_OPTS}"
-        echo "Libcurl directory set to: ${CURL_DIR}"
+        CURL_OPT="-DCURL_ROOT=$OPTARG"
+        echo "CURL_ROOT set to: ${OPTARG}"
         echo
         ;;
     Y)
-        YAJL_DIR="$OPTARG"
-        YAJL_LINK="-L${YAJL_DIR}/lib ${YAJL_LINK}"
-        CMAKE_OPTS="--with-yajl=${YAJL_DIR} ${CMAKE_OPTS}"
-        echo "Libyajl directory set to: ${YAJL_DIR}"
+        YAJL_OPT="-DYAJL_ROOT=$OPTARG"
+        echo "YAJL_ROOT set to: ${OPTARG}"
         echo
         ;;
     *)
@@ -189,9 +175,15 @@ if [ "$NPROCS" -eq "0" ]; then
     fi
 fi
 
-# Once HDF5 has been built, build the REST VOL plugin against HDF5.
+# Ensure that the vol-tests submodule gets checked out
+if [ -z "$(ls -A ${SCRIPT_DIR}/test/vol-tests)" ]; then
+    git submodule init
+    git submodule update
+fi
+
+# Build the REST VOL connector against HDF5.
 echo "*******************************************"
-echo "* Building REST VOL plugin and test suite *"
+echo "* Building REST VOL connector and test suite *"
 echo "*******************************************"
 echo
 
@@ -203,7 +195,7 @@ rm -f "${BUILD_DIR}/CMakeCache.txt"
 
 cd "${BUILD_DIR}"
 
-cmake -G "${CMAKE_GENERATOR}" -DCMAKE_INSTALL_PREFIX="${INSTALL_DIR}" "${PREBUILT_HDF5_OPT}" "${PLUGIN_DEBUG_OPT}" "${CURL_DEBUG_OPT}" "${MEM_TRACK_OPT}" "${SCRIPT_DIR}"
+CFLAGS="-D_POSIX_C_SOURCE=200809L" cmake -G "${CMAKE_GENERATOR}" "-DHDF5_ROOT=${HDF5_INSTALL_DIR}" -DCMAKE_INSTALL_PREFIX="${INSTALL_DIR}" "${CURL_OPT}" "${YAJL_OPT}" "${YAJL_LIB_OPT}" "${CONNECTOR_DEBUG_OPT}" "${CURL_DEBUG_OPT}" "${MEM_TRACK_OPT}" "${THREAD_SAFE_OPT}" "${SCRIPT_DIR}"
 
 echo "Build files have been generated for CMake generator '${CMAKE_GENERATOR}'"
 
@@ -211,5 +203,23 @@ echo "Build files have been generated for CMake generator '${CMAKE_GENERATOR}'"
 if [ "${CMAKE_GENERATOR}" = "Unix Makefiles" ]; then
   make -j${NPROCS} && make install || exit 1
 fi
+
+echo "REST VOL built"
+
+# Clean out the old CMake cache
+rm -f "${BUILD_DIR}/CMakeCache.txt"
+
+# Configure vol-tests
+
+mkdir -p "${BUILD_DIR}/tests/vol-tests"
+cd "${BUILD_DIR}/tests/vol-tests"
+
+CFLAGS="-D_POSIX_C_SOURCE=200809L" cmake -G "${CMAKE_GENERATOR}"  "-DHDF5_DIR=${HDF5_INSTALL_DIR}" -DCMAKE_INSTALL_PREFIX="${INSTALL_DIR}" "${CONNECTOR_DEBUG_OPT}" "${CURL_DEBUG_OPT}" "${MEM_TRACK_OPT}" "${THREAD_SAFE_OPT}" "${SCRIPT_DIR}/test/vol-tests"
+
+echo "Build files generated for vol-tests"
+
+make || exit 1
+ 
+echo "VOL tests built"
 
 exit 0
