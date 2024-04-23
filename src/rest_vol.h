@@ -392,7 +392,7 @@ extern const char *object_id_keys[];
 extern const char *link_class_keys[];
 extern const char *link_class_keys2[];
 
-/* JSON key to retrieve the version of server from a request to a file. */
+/* JSON keys to retrieve the version of server from a request to a file. */
 extern const char *server_version_keys[];
 
 /* JSON keys to retrieve a list of attributes */
