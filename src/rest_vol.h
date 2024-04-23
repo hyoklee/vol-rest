@@ -410,6 +410,12 @@ extern const char *link_creation_time_keys[];
  */
 extern const char *link_collection_keys2[];
 
+/* JSON keys to retrieve objects accessed through path(s) */
+extern const char *h5paths_keys[];
+
+/* JSON keys to retrieve the path to a domain in HSDS */
+extern const char *domain_keys[];
+
 /* A global struct containing the buffer which cURL will write its
  * responses out to after making a call to the server. The buffer
  * in this struct is allocated upon connector initialization and is
@@ -439,6 +445,17 @@ extern RV_type_info *RV_type_info_array_g[];
  *        Typedefs        *
  *                        *
  **************************/
+
+/* Values for the optimization of compound data reading and writing.  They indicate
+ * whether the fields of the source and destination are subset of each other
+ */
+typedef enum {
+    H5T_SUBSET_BADVALUE = -1, /* Invalid value */
+    H5T_SUBSET_FALSE    = 0,  /* Source and destination aren't subset of each other */
+    H5T_SUBSET_SRC,           /* Source is the subset of dest and no conversion is needed */
+    H5T_SUBSET_DST,           /* Dest is the subset of source and no conversion is needed */
+    H5T_SUBSET_CAP            /* Must be the last value */
+} RV_subset_t;
 
 /*
  * A struct which is used to return a link's name or the size of
@@ -573,14 +590,26 @@ typedef struct dataset_write_info {
     char       *base64_encoded_values;
     curl_off_t  write_len;
     upload_info uinfo;
+    const void *buf;
+
+    /* If writing using compound subsetting, this is a packed version of the
+     *  compound type containing only the selected members */
+    hid_t dense_cmpd_subset_dtype_id;
 } dataset_write_info;
 
 typedef struct dataset_read_info {
     H5S_sel_type sel_type;
     curl_off_t   post_len;
+    void        *buf;
 } dataset_read_info;
 
 typedef enum transfer_type_t { UNINIT = 0, READ = 1, WRITE = 2 } transfer_type_t;
+
+typedef enum content_type_t {
+    CONTENT_TYPE_UNINIT       = 0,
+    CONTENT_TYPE_JSON         = 1,
+    CONTENT_TYPE_OCTET_STREAM = 2
+} content_type_t;
 
 typedef struct dataset_transfer_info {
     struct curl_slist     *curl_headers;
@@ -592,7 +621,6 @@ typedef struct dataset_transfer_info {
     struct response_buffer resp_buffer;
 
     RV_object_t *dataset;
-    void        *buf;
     char        *request_url;
     hid_t        mem_type_id;
     hid_t        mem_space_id;
@@ -671,6 +699,10 @@ typedef enum {
     RV_TCONV_REUSE_BKG    /* Use buffer as background buffer */
 } RV_tconv_reuse_t;
 
+typedef struct get_link_val_out {
+    size_t *in_buf_size;
+    void   *buf;
+} get_link_val_out;
 /****************************
  *                          *
  *        Prototypes        *
@@ -691,29 +723,32 @@ const char *H5_rest_basename(const char *path);
 char *H5_rest_dirname(const char *path);
 
 /* Helper function to parse an HTTP response according to the given parse callback function */
-herr_t RV_parse_response(char *HTTP_response, void *callback_data_in, void *callback_data_out,
-                         herr_t (*parse_callback)(char *, void *, void *));
+herr_t RV_parse_response(char *HTTP_response, const void *callback_data_in, void *callback_data_out,
+                         herr_t (*parse_callback)(char *, const void *, void *));
 
 /* Callback for RV_parse_response() to capture an object's URI */
-herr_t RV_copy_object_URI_callback(char *HTTP_response, void *callback_data_in, void *callback_data_out);
+herr_t RV_copy_object_URI_callback(char *HTTP_response, const void *callback_data_in,
+                                   void *callback_data_out);
 
 /* Callback for RV_parse_response() to capture an object's creation properties */
-herr_t RV_copy_object_loc_info_callback(char *HTTP_response, void *callback_data_in, void *callback_data_out);
+herr_t RV_copy_object_loc_info_callback(char *HTTP_response, const void *callback_data_in,
+                                        void *callback_data_out);
 
 /* Callback for RV_parse_response() to access the name of the n-th returned attribute */
-herr_t RV_copy_attribute_name_by_index(char *HTTP_response, void *callback_data_in, void *callback_data_out);
+herr_t RV_copy_attribute_name_by_index(char *HTTP_response, const void *callback_data_in,
+                                       void *callback_data_out);
 
 /* Callback for RV_parse_response() to access the name of the n-th returned link */
-herr_t RV_copy_link_name_by_index(char *HTTP_response, void *callback_data_in, void *callback_data_out);
+herr_t RV_copy_link_name_by_index(char *HTTP_response, const void *callback_data_in, void *callback_data_out);
 
 /* Callback for RV_parse_response() to capture the version of the server api */
-herr_t RV_parse_server_version(char *HTTP_response, void *callback_data_in, void *callback_data_out);
+herr_t RV_parse_server_version(char *HTTP_response, const void *callback_data_in, void *callback_data_out);
 
 /* Helper function to find an object given a starting object to search from and a path */
 
 htri_t RV_find_object_by_path(RV_object_t *parent_obj, const char *obj_path, H5I_type_t *target_object_type,
-                              herr_t (*obj_found_callback)(char *, void *, void *), void *callback_data_in,
-                              void *callback_data_out);
+                              herr_t (*obj_found_callback)(char *, const void *, void *),
+                              void *callback_data_in, void *callback_data_out);
 
 /* Helper function to parse a JSON string representing an HDF5 Dataspace and
  * setup an hid_t for the Dataspace */
@@ -737,17 +772,30 @@ size_t H5_rest_curl_write_data_callback_no_global(char *buffer, size_t size, siz
 /* Helper to turn an object type into a string for a server request */
 herr_t RV_set_object_type_header(H5I_type_t parent_obj_type, const char **parent_obj_type_header);
 
-/* Helper function to parse an object's allocated size from server response */
-herr_t RV_parse_allocated_size_callback(char *HTTP_response, void *callback_data_in, void *callback_data_out);
+/* Helper functions to parse an object's allocated size from server response */
+herr_t RV_parse_allocated_size_cb(char *HTTP_response, void *callback_data_in, void *callback_data_out);
+herr_t RV_parse_domain_allocated_size_cb(char *HTTP_response, const void *callback_data_in,
+                                         void *callback_data_out);
 
 void RV_free_visited_link_hash_table_key(rv_hash_table_key_t value);
 
 /* Counterpart of CURL_PERFORM that takes a curl multi handle,
  * and waits until all requests on it have finished before returning. */
-herr_t RV_curl_multi_perform(CURL *curl_multi_ptr, dataset_transfer_info *transfer_info, size_t count,
-                             herr_t(success_callback)(hid_t mem_type_id, hid_t mem_space_id,
-                                                      hid_t file_type_id, hid_t file_space_id, void *buf,
-                                                      struct response_buffer resp_buffer));
+herr_t RV_curl_multi_perform(CURL *curl_multi_ptr, dataset_transfer_info *transfer_info, size_t count);
+
+/* Callbacks used for post-processing after a curl request succeeds */
+herr_t RV_dataset_read_cb(hid_t mem_type_id, hid_t mem_space_id, hid_t file_type_id, hid_t file_space_id,
+                          void *buf, struct response_buffer resp_buffer);
+
+/* Helper functions for cURL requests to the server */
+long RV_curl_delete(CURL *curl_handle, server_info_t *server_info, const char *request_endpoint,
+                    const char *filename);
+long RV_curl_put(CURL *curl_handle, server_info_t *server_info, const char *request_endpoint,
+                 const char *filename, upload_info *uinfo, content_type_t content_type);
+long RV_curl_get(CURL *curl_handle, server_info_t *server_info, const char *request_endpoint,
+                 const char *filename, content_type_t content_type);
+long RV_curl_post(CURL *curl_handle, server_info_t *server_info, const char *request_endpoint,
+                  const char *filename, const char *post_data, size_t post_size, content_type_t content_type);
 
 /* Dtermine if datatype conversion is necessary */
 htri_t RV_need_tconv(hid_t src_type_id, hid_t dst_type_id);
@@ -764,6 +812,12 @@ herr_t RV_convert_datatype_to_JSON(hid_t type_id, char **type_body, size_t *type
 /* Helper function to escape control characters for JSON strings */
 herr_t RV_JSON_escape_string(const char *in, char *out, size_t *out_size);
 
+/* Determine if a read from file to mem dtype is a compound subset read */
+herr_t RV_get_cmpd_subset_type(hid_t src_type_id, hid_t dst_type_id, RV_subset_t *subset_info);
+
+/* Helper to get information about members in dst that are included in src compound */
+herr_t RV_get_cmpd_subset_nmembers(hid_t src_type_id, hid_t dst_type_id, size_t *num_cmpd_members);
+
 #define SERVER_VERSION_MATCHES_OR_EXCEEDS(version, major_needed, minor_needed, patch_needed)                 \
     (version.major > major_needed) || (version.major == major_needed && version.minor > minor_needed) ||     \
         (version.major == major_needed && version.minor == minor_needed && version.patch >= patch_needed)
@@ -776,6 +830,11 @@ herr_t RV_JSON_escape_string(const char *in, char *out, size_t *out_size);
 
 #define SERVER_VERSION_SUPPORTS_FIXED_LENGTH_UTF8(version)                                                   \
     (SERVER_VERSION_MATCHES_OR_EXCEEDS(version, 0, 8, 5))
+
+#define SERVER_VERSION_SUPPORTS_LONG_NAMES(version) (SERVER_VERSION_MATCHES_OR_EXCEEDS(version, 0, 8, 6))
+
+#define SERVER_VERSION_SUPPORTS_MEMBER_SELECTION(version)                                                    \
+    (SERVER_VERSION_MATCHES_OR_EXCEEDS(version, 0, 8, 6))
 
 #ifdef __cplusplus
 }

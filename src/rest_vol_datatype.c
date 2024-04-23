@@ -70,21 +70,19 @@ RV_datatype_commit(void *obj, const H5VL_loc_params_t *loc_params, const char *n
     RV_object_t *new_datatype          = NULL;
     size_t       commit_request_nalloc = 0;
     size_t       link_body_nalloc      = 0;
-    size_t       host_header_len       = 0;
     size_t       datatype_body_len     = 0;
     size_t       path_size             = 0;
     size_t       path_len              = 0;
-    const char  *base_URL              = NULL;
-    char        *host_header           = NULL;
     char        *commit_request_body   = NULL;
     char        *datatype_body         = NULL;
     char        *link_body             = NULL;
     char        *path_dirname          = NULL;
-    char         request_url[URL_MAX_LENGTH];
+    char         request_endpoint[URL_MAX_LENGTH];
     int          commit_request_len = 0;
     int          link_body_len      = 0;
     int          url_len            = 0;
     void        *ret_value          = NULL;
+    long         http_response;
 
 #ifdef RV_CONNECTOR_DEBUG
     printf("-> Received datatype commit call with following parameters:\n");
@@ -102,9 +100,6 @@ RV_datatype_commit(void *obj, const H5VL_loc_params_t *loc_params, const char *n
 
     if (H5I_FILE != parent->obj_type && H5I_GROUP != parent->obj_type)
         FUNC_GOTO_ERROR(H5E_ARGS, H5E_BADVALUE, NULL, "parent object not a file or group");
-
-    if ((base_URL = parent->domain->u.file.server_info.base_URL) == NULL)
-        FUNC_GOTO_ERROR(H5E_ARGS, H5E_BADVALUE, NULL, "parent object does not have valid server URL");
 
     /* Check for write access */
     if (!(parent->domain->u.file.intent & H5F_ACC_RDWR))
@@ -231,24 +226,8 @@ RV_datatype_commit(void *obj, const H5VL_loc_params_t *loc_params, const char *n
     printf("-> Datatype commit request body:\n%s\n\n", commit_request_body);
 #endif
 
-    /* Setup the host header */
-    host_header_len = strlen(parent->domain->u.file.filepath_name) + strlen(host_string) + 1;
-    if (NULL == (host_header = (char *)RV_malloc(host_header_len)))
-        FUNC_GOTO_ERROR(H5E_DATATYPE, H5E_CANTALLOC, NULL, "can't allocate space for request Host header");
-
-    strcpy(host_header, host_string);
-
-    curl_headers = curl_slist_append(curl_headers, strncat(host_header, parent->domain->u.file.filepath_name,
-                                                           host_header_len - strlen(host_string) - 1));
-
-    /* Disable use of Expect: 100 Continue HTTP response */
-    curl_headers = curl_slist_append(curl_headers, "Expect:");
-
-    /* Instruct cURL that we are sending JSON */
-    curl_headers = curl_slist_append(curl_headers, "Content-Type: application/json");
-
     /* Redirect cURL from the base URL to "/datatypes" to commit the datatype */
-    if ((url_len = snprintf(request_url, URL_MAX_LENGTH, "%s/datatypes", base_URL)) < 0)
+    if ((url_len = snprintf(request_endpoint, URL_MAX_LENGTH, "/datatypes")) < 0)
         FUNC_GOTO_ERROR(H5E_DATATYPE, H5E_SYSERRSTR, NULL, "snprintf error");
 
     if (url_len >= URL_MAX_LENGTH)
@@ -256,36 +235,16 @@ RV_datatype_commit(void *obj, const H5VL_loc_params_t *loc_params, const char *n
                         "datatype create URL size exceeded maximum URL size");
 
 #ifdef RV_CONNECTOR_DEBUG
-    printf("-> Datatype commit URL: %s\n\n", request_url);
+    printf("-> Datatype commit URL: %s\n\n", request_endpoint);
 #endif
 
-    if (CURLE_OK !=
-        curl_easy_setopt(curl, CURLOPT_USERNAME, new_datatype->domain->u.file.server_info.username))
-        FUNC_GOTO_ERROR(H5E_DATATYPE, H5E_CANTSET, NULL, "can't set cURL username: %s", curl_err_buf);
-    if (CURLE_OK !=
-        curl_easy_setopt(curl, CURLOPT_PASSWORD, new_datatype->domain->u.file.server_info.password))
-        FUNC_GOTO_ERROR(H5E_DATATYPE, H5E_CANTSET, NULL, "can't set cURL password: %s", curl_err_buf);
-    if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_HTTPHEADER, curl_headers))
-        FUNC_GOTO_ERROR(H5E_DATATYPE, H5E_CANTSET, NULL, "can't set cURL HTTP headers: %s", curl_err_buf);
-    if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_POST, 1))
-        FUNC_GOTO_ERROR(H5E_DATATYPE, H5E_CANTSET, NULL, "can't set up cURL to make HTTP POST request: %s",
-                        curl_err_buf);
-    if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_POSTFIELDS, commit_request_body))
-        FUNC_GOTO_ERROR(H5E_DATATYPE, H5E_CANTSET, NULL, "can't set cURL POST data: %s", curl_err_buf);
-    if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)commit_request_len))
-        FUNC_GOTO_ERROR(H5E_DATATYPE, H5E_CANTSET, NULL, "can't set cURL POST data size: %s", curl_err_buf);
-    if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_URL, request_url))
-        FUNC_GOTO_ERROR(H5E_DATATYPE, H5E_CANTSET, NULL, "can't set cURL request URL: %s", curl_err_buf);
+    http_response = RV_curl_post(curl, &parent->domain->u.file.server_info, request_endpoint,
+                                 parent->domain->u.file.filepath_name, (const char *)commit_request_body,
+                                 (size_t)commit_request_len, CONTENT_TYPE_JSON);
 
-#ifdef RV_CONNECTOR_DEBUG
-    printf("-> Committing datatype\n\n");
-
-    printf("   /***********************************\\\n");
-    printf("-> | Making POST request to the server |\n");
-    printf("   \\***********************************/\n\n");
-#endif
-
-    CURL_PERFORM(curl, H5E_DATATYPE, H5E_BADVALUE, NULL);
+    if (!HTTP_SUCCESS(http_response))
+        FUNC_GOTO_ERROR(H5E_DATATYPE, H5E_BADVALUE, NULL, "couldn't commit datatype: received HTTP %ld",
+                        http_response);
 
 #ifdef RV_CONNECTOR_DEBUG
     printf("-> Committed datatype\n\n");
@@ -317,8 +276,6 @@ done:
         RV_free(path_dirname);
     if (commit_request_body)
         RV_free(commit_request_body);
-    if (host_header)
-        RV_free(host_header);
     if (datatype_body)
         RV_free(datatype_body);
     if (link_body)
@@ -328,11 +285,6 @@ done:
     if (new_datatype && !ret_value)
         if (RV_datatype_close(new_datatype, FAIL, NULL) < 0)
             FUNC_DONE_ERROR(H5E_DATATYPE, H5E_CANTCLOSEOBJ, NULL, "can't close datatype");
-
-    if (curl_headers) {
-        curl_slist_free_all(curl_headers);
-        curl_headers = NULL;
-    } /* end if */
 
     PRINT_ERROR_STACK;
 
@@ -1474,18 +1426,19 @@ done:
 static hid_t
 RV_convert_JSON_to_datatype(const char *type)
 {
-    yajl_val parse_tree = NULL, key_obj = NULL;
-    hsize_t *array_dims = NULL;
-    size_t   i;
-    hid_t    datatype                   = FAIL;
-    hid_t   *compound_member_type_array = NULL;
-    hid_t    enum_base_type             = FAIL;
-    char   **compound_member_names      = NULL;
-    char    *datatype_class             = NULL;
-    char    *array_base_type_substring  = NULL;
-    char    *tmp_cmpd_type_buffer       = NULL;
-    char    *tmp_enum_base_type_buffer  = NULL;
-    hid_t    ret_value                  = FAIL;
+    yajl_val    parse_tree = NULL, key_obj = NULL, target_tree = NULL;
+    hsize_t    *array_dims = NULL;
+    size_t      i;
+    hid_t       datatype                   = FAIL;
+    hid_t      *compound_member_type_array = NULL;
+    hid_t       enum_base_type             = FAIL;
+    char      **compound_member_names      = NULL;
+    char       *datatype_class             = NULL;
+    char       *array_base_type_substring  = NULL;
+    char       *tmp_cmpd_type_buffer       = NULL;
+    char       *tmp_enum_base_type_buffer  = NULL;
+    const char *path_name                  = NULL;
+    hid_t       ret_value                  = FAIL;
 
 #ifdef RV_CONNECTOR_DEBUG
     printf("-> Converting JSON buffer %s to hid_t\n", type);
@@ -1494,6 +1447,24 @@ RV_convert_JSON_to_datatype(const char *type)
     /* Retrieve the datatype class */
     if (NULL == (parse_tree = yajl_tree_parse(type, NULL, 0)))
         FUNC_GOTO_ERROR(H5E_DATATYPE, H5E_PARSEERROR, FAIL, "JSON parse tree creation failed");
+
+    target_tree = parse_tree;
+
+    /* If the response contains 'h5paths',
+     * it may describe multiple objects. Needs to be unwrapped first. */
+    if (NULL != yajl_tree_get(parse_tree, h5paths_keys, yajl_t_object)) {
+        if (NULL == (target_tree = yajl_tree_get(parse_tree, h5paths_keys, yajl_t_object)))
+            FUNC_GOTO_ERROR(H5E_OBJECT, H5E_PARSEERROR, FAIL, "can't parse h5paths object");
+
+        /* Access the first object under h5paths */
+        if (NULL == (path_name = target_tree->u.object.keys[0]))
+            FUNC_GOTO_ERROR(H5E_OBJECT, H5E_PARSEERROR, FAIL, "parsed path name was NULL");
+
+        const char *path_keys[] = {path_name, (const char *)0};
+
+        if (NULL == (target_tree = yajl_tree_get(target_tree, path_keys, yajl_t_object)))
+            FUNC_GOTO_ERROR(H5E_OBJECT, H5E_PARSEERROR, FAIL, "unable to parse object under path key");
+    }
 
     if (NULL == (key_obj = yajl_tree_get(parse_tree, type_class_keys, yajl_t_string)))
         FUNC_GOTO_ERROR(H5E_DATATYPE, H5E_PARSEERROR, FAIL, "can't parse datatype from JSON representation");
@@ -2638,3 +2609,176 @@ done:
 
     return ret_value;
 } /* end RV_tconv_init() */
+
+/* Determine the subset relationsip (if any) between src and dst datatypes */
+herr_t
+RV_get_cmpd_subset_type(hid_t src_type_id, hid_t dst_type_id, RV_subset_t *subset)
+{
+    herr_t      ret_value      = SUCCEED;
+    H5T_class_t dst_type_class = H5T_NO_CLASS, src_type_class = H5T_NO_CLASS;
+    char       *src_member_name = NULL, *dst_member_name = NULL;
+    size_t      src_member_offset = 0, dst_member_offset = 0;
+    hid_t       src_member_type = H5I_INVALID_HID, dst_member_type = H5I_INVALID_HID;
+    int         dst_nmembs = 0, src_nmembs = 0;
+    hbool_t     member_match = FALSE;
+
+    if (H5T_NO_CLASS == (src_type_class = H5Tget_class(src_type_id)))
+        FUNC_GOTO_ERROR(H5E_DATATYPE, H5E_BADVALUE, FAIL, "source datatype is invalid");
+
+    if (H5T_NO_CLASS == (dst_type_class = H5Tget_class(dst_type_id)))
+        FUNC_GOTO_ERROR(H5E_DATATYPE, H5E_BADVALUE, FAIL, "destination datatype is invalid");
+
+    if ((dst_type_class != H5T_COMPOUND) || (src_type_class != H5T_COMPOUND)) {
+        *subset = H5T_SUBSET_FALSE;
+        FUNC_GOTO_DONE(SUCCEED);
+    }
+
+    if ((dst_nmembs = H5Tget_nmembers(dst_type_id)) < 0)
+        FUNC_GOTO_ERROR(H5E_DATATYPE, H5E_CANTGET, FAIL, "can't get nmembers of destination datatype");
+
+    if ((src_nmembs = H5Tget_nmembers(src_type_id)) < 0)
+        FUNC_GOTO_ERROR(H5E_DATATYPE, H5E_CANTGET, FAIL, "can't get nmembers of source datatype");
+
+    /* Determine subset status by comparing members */
+    if (src_nmembs < dst_nmembs) {
+        for (unsigned src_idx = 0; src_idx < src_nmembs; src_idx++) {
+            member_match = FALSE;
+
+            if ((src_member_type = H5Tget_member_type(src_type_id, src_idx)) == H5I_INVALID_HID)
+                FUNC_GOTO_ERROR(H5E_DATATYPE, H5E_CANTGET, FAIL, "can't get memory datatype member type");
+
+            if ((src_member_name = H5Tget_member_name(src_type_id, src_idx)) == NULL)
+                FUNC_DONE_ERROR(H5E_DATATYPE, H5E_CANTGET, FAIL, "can't get memory datatype member name");
+
+            if ((src_member_offset = H5Tget_member_offset(src_type_id, src_idx)) < 0)
+                FUNC_DONE_ERROR(H5E_DATATYPE, H5E_CANTGET, FAIL, "can't get memory datatype member offset");
+
+            /* Search for match in dst compound */
+            for (unsigned dst_idx = 0; dst_idx < dst_nmembs; dst_idx++) {
+                if ((dst_member_type = H5Tget_member_type(dst_type_id, dst_idx)) == H5I_INVALID_HID)
+                    FUNC_GOTO_ERROR(H5E_DATATYPE, H5E_CANTGET, FAIL,
+                                    "can't get destination datatype member type");
+
+                if ((dst_member_name = H5Tget_member_name(dst_type_id, dst_idx)) == NULL)
+                    FUNC_DONE_ERROR(H5E_DATATYPE, H5E_CANTGET, FAIL,
+                                    "can't get destination datatype member name");
+
+                if ((dst_member_offset = H5Tget_member_offset(dst_type_id, dst_idx)) < 0)
+                    FUNC_DONE_ERROR(H5E_DATATYPE, H5E_CANTGET, FAIL,
+                                    "can't get destination datatype member offset");
+
+                /* Compare member names and offsets */
+                if (!strcmp(src_member_name, dst_member_name) && (src_member_offset == dst_member_offset) &&
+                    (H5Tequal(src_member_type, dst_member_type) > 0)) {
+                    member_match = TRUE;
+                }
+
+                /* Clean up */
+                H5free_memory(dst_member_name);
+                dst_member_name = NULL;
+
+                if (H5Tclose(dst_member_type) < 0)
+                    FUNC_GOTO_ERROR(H5E_DATATYPE, H5E_CANTCLOSEOBJ, FAIL,
+                                    "can't close destination datatype member type");
+                dst_member_type = H5T_NO_CLASS;
+
+                /* If no match exists for this source member, the src compound is not a subset */
+                if ((dst_idx == dst_nmembs - 1) && !member_match) {
+                    *subset = H5T_SUBSET_FALSE;
+                    FUNC_GOTO_DONE(SUCCEED);
+                }
+            }
+
+            /* Clean up */
+            H5free_memory(src_member_name);
+            src_member_name = NULL;
+
+            if (H5Tclose(src_member_type) < 0)
+                FUNC_DONE_ERROR(H5E_DATATYPE, H5E_CANTCLOSEOBJ, FAIL, "can't close source datatype member");
+            src_member_type = H5T_NO_CLASS;
+
+            /* If a match was found for every member, src is a subset of dst */
+            *subset = H5T_SUBSET_SRC;
+        }
+    }
+    else if (dst_nmembs < src_nmembs) {
+        for (unsigned dst_idx = 0; dst_idx < dst_nmembs; dst_idx++) {
+            member_match = FALSE;
+            if ((dst_member_type = H5Tget_member_type(dst_type_id, dst_idx)) == H5I_INVALID_HID)
+                FUNC_GOTO_ERROR(H5E_DATATYPE, H5E_CANTGET, FAIL,
+                                "can't get destination datatype member type");
+
+            if ((dst_member_name = H5Tget_member_name(dst_type_id, dst_idx)) == NULL)
+                FUNC_DONE_ERROR(H5E_DATATYPE, H5E_CANTGET, FAIL,
+                                "can't get destination datatype member name");
+
+            if ((dst_member_offset = H5Tget_member_offset(dst_type_id, dst_idx)) < 0)
+                FUNC_DONE_ERROR(H5E_DATATYPE, H5E_CANTGET, FAIL,
+                                "can't get destination datatype member offset");
+
+            /* Search for match in src compound */
+            for (unsigned src_idx = 0; src_idx < src_nmembs; src_idx++) {
+                if ((src_member_type = H5Tget_member_type(src_type_id, src_idx)) == H5I_INVALID_HID)
+                    FUNC_GOTO_ERROR(H5E_DATATYPE, H5E_CANTGET, FAIL, "can't get memory datatype member type");
+
+                if ((src_member_name = H5Tget_member_name(src_type_id, src_idx)) == NULL)
+                    FUNC_DONE_ERROR(H5E_DATATYPE, H5E_CANTGET, FAIL, "can't get memory datatype member name");
+
+                if ((src_member_offset = H5Tget_member_offset(src_type_id, src_idx)) < 0)
+                    FUNC_DONE_ERROR(H5E_DATATYPE, H5E_CANTGET, FAIL,
+                                    "can't get memory datatype member offset");
+
+                /* Compare member names and offsets */
+                if (!strcmp(dst_member_name, src_member_name) && (dst_member_offset == src_member_offset) &&
+                    (H5Tequal(dst_member_type, src_member_type) > 0)) {
+                    member_match = TRUE;
+                }
+                /* Clean up */
+                H5free_memory(src_member_name);
+                src_member_name = NULL;
+
+                if (H5Tclose(src_member_type) < 0)
+                    FUNC_GOTO_ERROR(H5E_DATATYPE, H5E_CANTCLOSEOBJ, FAIL,
+                                    "can't close memory datatype member type");
+                src_member_type = H5T_NO_CLASS;
+
+                /* If no match exists for this destination member, the dst compound is not a subset */
+                if ((src_idx == src_nmembs - 1) && !member_match) {
+                    *subset = H5T_SUBSET_FALSE;
+                    FUNC_GOTO_DONE(SUCCEED);
+                }
+            }
+
+            /* Clean up */
+            H5free_memory(dst_member_name);
+            dst_member_name = NULL;
+
+            if (H5Tclose(dst_member_type) < 0)
+                FUNC_DONE_ERROR(H5E_DATATYPE, H5E_CANTCLOSEOBJ, FAIL,
+                                "can't close destination datatype member");
+            dst_member_type = H5T_NO_CLASS;
+
+            /* If a match was found for every member, dst is a subset of source */
+            *subset = H5T_SUBSET_DST;
+        }
+    }
+    else {
+        *subset = H5T_SUBSET_FALSE;
+    }
+
+done:
+    if (src_member_name)
+        H5free_memory(src_member_name);
+    if (dst_member_name)
+        H5free_memory(dst_member_name);
+
+    if (src_member_type > 0)
+        if (H5Tclose(src_member_type) < 0)
+            FUNC_DONE_ERROR(H5E_DATATYPE, H5E_CANTCLOSEOBJ, FAIL, "can't close source datatype member");
+
+    if (dst_member_type > 0)
+        if (H5Tclose(dst_member_type) < 0)
+            FUNC_DONE_ERROR(H5E_DATATYPE, H5E_CANTCLOSEOBJ, FAIL, "can't close destination datatype member");
+
+    return ret_value;
+}

@@ -24,18 +24,19 @@
 #define H5L_EXT_FLAGS_ALL 0
 
 /* Set of callbacks for RV_parse_response() */
-static herr_t RV_get_link_name_by_idx_callback(char *HTTP_response, void *callback_data_in,
+static herr_t RV_get_link_name_by_idx_callback(char *HTTP_response, const void *callback_data_in,
                                                void *callback_data_out);
-static herr_t RV_link_iter_callback(char *HTTP_response, void *callback_data_in, void *callback_data_out);
+static herr_t RV_link_iter_callback(char *HTTP_response, const void *callback_data_in,
+                                    void *callback_data_out);
 
 /* Helper functions to work with a table of links for link iteration */
 static herr_t RV_build_link_table(char *HTTP_response, hbool_t is_recursive,
                                   int (*sort_func)(const void *, const void *), link_table_entry **link_table,
                                   size_t *num_entries, rv_hash_table_t *visited_link_table,
-                                  const char *base_URL);
+                                  RV_object_t *loc_obj);
 static void   RV_free_link_table(link_table_entry *link_table, size_t num_entries);
-static herr_t RV_traverse_link_table(link_table_entry *link_table, size_t num_entries, iter_data *iter_data,
-                                     const char *cur_link_rel_path);
+static herr_t RV_traverse_link_table(link_table_entry *link_table, size_t num_entries,
+                                     const iter_data *iter_data, const char *cur_link_rel_path);
 
 /* Qsort callbacks to sort links by name or creation order */
 static int H5_rest_cmp_links_by_creation_order_inc(const void *link1, const void *link2);
@@ -73,16 +74,16 @@ RV_link_create(H5VL_link_create_args_t *args, void *obj, const H5VL_loc_params_t
     RV_object_t       *new_link_loc_obj                = (RV_object_t *)obj;
     upload_info        uinfo;
     size_t             create_request_nalloc = 0;
-    size_t             host_header_len       = 0;
+    size_t             escaped_link_size     = 0;
     void              *hard_link_target_obj;
-    const char        *base_URL            = NULL;
-    char              *host_header         = NULL;
     char              *create_request_body = NULL;
-    char               request_url[URL_MAX_LENGTH];
+    char               request_endpoint[URL_MAX_LENGTH];
     char              *url_encoded_link_name   = NULL;
+    char              *escaped_link_name       = NULL;
     int                create_request_body_len = 0;
     int                url_len                 = 0;
-    herr_t             ret_value               = SUCCEED;
+    long               http_response;
+    herr_t             ret_value = SUCCEED;
 
 #ifdef RV_CONNECTOR_DEBUG
     printf("-> Received link create call with following parameters:\n");
@@ -124,9 +125,6 @@ RV_link_create(H5VL_link_create_args_t *args, void *obj, const H5VL_loc_params_t
     if (!new_link_loc_obj)
         FUNC_GOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "link location object is NULL");
 
-    if ((base_URL = new_link_loc_obj->domain->u.file.server_info.base_URL) == NULL)
-        FUNC_GOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "link creation requires valid server URL");
-
     /* Validate loc_id and check for write access on the file */
     if (H5I_FILE != new_link_loc_obj->obj_type && H5I_GROUP != new_link_loc_obj->obj_type)
         FUNC_GOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "link location object not a file or group");
@@ -135,6 +133,21 @@ RV_link_create(H5VL_link_create_args_t *args, void *obj, const H5VL_loc_params_t
 
     if (!(new_link_loc_obj->domain->u.file.intent & H5F_ACC_RDWR))
         FUNC_GOTO_ERROR(H5E_FILE, H5E_BADVALUE, FAIL, "no write intent on file");
+
+    /* If link name will be sent in request body, JSON escape it */
+    if (SERVER_VERSION_SUPPORTS_LONG_NAMES(new_link_loc_obj->domain->u.file.server_info.version) &&
+        loc_params->loc_data.loc_by_name.name) {
+        if (RV_JSON_escape_string(loc_params->loc_data.loc_by_name.name, escaped_link_name,
+                                  &escaped_link_size) < 0)
+            FUNC_GOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "can't get size of JSON escaped link name");
+
+        if ((escaped_link_name = RV_malloc(escaped_link_size)) < 0)
+            FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTALLOC, FAIL, "can't allocate space for escaped link name");
+
+        if (RV_JSON_escape_string(loc_params->loc_data.loc_by_name.name, escaped_link_name,
+                                  &escaped_link_size) < 0)
+            FUNC_GOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "can't JSON escape link name");
+    }
 
     switch (args->op_type) {
         /* H5Lcreate_hard */
@@ -197,21 +210,46 @@ RV_link_create(H5VL_link_create_args_t *args, void *obj, const H5VL_loc_params_t
 #endif
 
             {
-                const char *const fmt_string = "{\"id\": \"%s\"}";
+                const char *const fmt_string_no_title = "{\"id\": \"%s\"}";
+                const char *const fmt_string_title    = "{\"links\": {\"%s\": {\"id\": \"%s\"}}}";
 
                 /* Form the request body to create the Link */
-                create_request_nalloc = (strlen(fmt_string) - 2) + strlen(target_URI) + 1;
-                if (NULL == (create_request_body = (char *)RV_malloc(create_request_nalloc)))
-                    FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTALLOC, FAIL,
-                                    "can't allocate space for link create request body");
+                if (SERVER_VERSION_SUPPORTS_LONG_NAMES(
+                        new_link_loc_obj->domain->u.file.server_info.version) &&
+                    loc_params->loc_data.loc_by_name.name) {
+                    /* Include escaped link name in body */
+                    create_request_nalloc =
+                        (strlen(fmt_string_title) - 4) + strlen(target_URI) + strlen(escaped_link_name) + 1;
 
-                if ((create_request_body_len =
-                         snprintf(create_request_body, create_request_nalloc, fmt_string, target_URI)) < 0)
-                    FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
+                    if (NULL == (create_request_body = (char *)RV_malloc(create_request_nalloc)))
+                        FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTALLOC, FAIL,
+                                        "can't allocate space for link create request body");
 
-                if ((size_t)create_request_body_len >= create_request_nalloc)
-                    FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL,
-                                    "link create request body size exceeded allocated buffer size");
+                    if ((create_request_body_len =
+                             snprintf(create_request_body, create_request_nalloc, fmt_string_title,
+                                      escaped_link_name, target_URI)) < 0)
+                        FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
+
+                    if ((size_t)create_request_body_len >= create_request_nalloc)
+                        FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL,
+                                        "link create request body size buffer size");
+                }
+                else {
+                    /* Body only contains target id */
+                    create_request_nalloc = (strlen(fmt_string_no_title) - 2) + strlen(target_URI) + 1;
+
+                    if (NULL == (create_request_body = (char *)RV_malloc(create_request_nalloc)))
+                        FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTALLOC, FAIL,
+                                        "can't allocate space for link create request body");
+
+                    if ((create_request_body_len = snprintf(create_request_body, create_request_nalloc,
+                                                            fmt_string_no_title, target_URI)) < 0)
+                        FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
+
+                    if ((size_t)create_request_body_len >= create_request_nalloc)
+                        FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL,
+                                        "link create request body size exceeded allocated buffer size");
+                }
             }
 
 #ifdef RV_CONNECTOR_DEBUG
@@ -231,21 +269,46 @@ RV_link_create(H5VL_link_create_args_t *args, void *obj, const H5VL_loc_params_t
 #endif
 
             {
-                const char *const fmt_string = "{\"h5path\": \"%s\"}";
+                const char *const fmt_string_no_title = "{\"h5path\": \"%s\"}";
+                const char *const fmt_string_title    = "{\"links\": {\"%s\": {\"h5path\": \"%s\"}}}";
 
                 /* Form the request body to create the Link */
-                create_request_nalloc = (strlen(fmt_string) - 2) + strlen(link_target) + 1;
-                if (NULL == (create_request_body = (char *)RV_malloc(create_request_nalloc)))
-                    FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTALLOC, FAIL,
-                                    "can't allocate space for link create request body");
+                if (SERVER_VERSION_SUPPORTS_LONG_NAMES(
+                        new_link_loc_obj->domain->u.file.server_info.version) &&
+                    loc_params->loc_data.loc_by_name.name) {
+                    /* Body contains link title */
+                    create_request_nalloc =
+                        (strlen(fmt_string_title) - 4) + strlen(link_target) + strlen(escaped_link_name) + 1;
 
-                if ((create_request_body_len =
-                         snprintf(create_request_body, create_request_nalloc, fmt_string, link_target)) < 0)
-                    FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
+                    if (NULL == (create_request_body = (char *)RV_malloc(create_request_nalloc)))
+                        FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTALLOC, FAIL,
+                                        "can't allocate space for link create request body");
 
-                if ((size_t)create_request_body_len >= create_request_nalloc)
-                    FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL,
-                                    "link create request body size exceeded allocated buffer size");
+                    if ((create_request_body_len =
+                             snprintf(create_request_body, create_request_nalloc, fmt_string_title,
+                                      escaped_link_name, link_target)) < 0)
+                        FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
+
+                    if ((size_t)create_request_body_len >= create_request_nalloc)
+                        FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL,
+                                        "link create request body size exceeded allocated buffer size");
+                }
+                else {
+                    /* Body only contains h5path */
+                    create_request_nalloc = (strlen(fmt_string_no_title) - 2) + strlen(link_target) + 1;
+
+                    if (NULL == (create_request_body = (char *)RV_malloc(create_request_nalloc)))
+                        FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTALLOC, FAIL,
+                                        "can't allocate space for link create request body");
+
+                    if ((create_request_body_len = snprintf(create_request_body, create_request_nalloc,
+                                                            fmt_string_no_title, link_target)) < 0)
+                        FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
+
+                    if ((size_t)create_request_body_len >= create_request_nalloc)
+                        FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL,
+                                        "link create request body size exceeded allocated buffer size");
+                }
             }
 
 #ifdef RV_CONNECTOR_DEBUG
@@ -275,22 +338,47 @@ RV_link_create(H5VL_link_create_args_t *args, void *obj, const H5VL_loc_params_t
 #endif
 
             {
-                const char *const fmt_string = "{\"h5domain\": \"%s\", \"h5path\": \"%s\"}";
+                const char *const fmt_string_no_title = "{\"h5domain\": \"%s\", \"h5path\": \"%s\"}";
+                const char *const fmt_string_title =
+                    "{\"links\": {\"%s\": {\"h5domain\": \"%s\", \"h5path\": \"%s\"}}}";
 
                 /* Form the request body to create the Link */
-                create_request_nalloc =
-                    (strlen(fmt_string) - 4) + strlen(file_path) + strlen(link_target) + 1;
-                if (NULL == (create_request_body = (char *)RV_malloc(create_request_nalloc)))
-                    FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTALLOC, FAIL,
-                                    "can't allocate space for link create request body");
+                if (SERVER_VERSION_SUPPORTS_LONG_NAMES(
+                        new_link_loc_obj->domain->u.file.server_info.version) &&
+                    loc_params->loc_data.loc_by_name.name) {
+                    /* Body contains link name */
+                    create_request_nalloc = (strlen(fmt_string_title) - 6) + strlen(file_path) +
+                                            strlen(link_target) + strlen(escaped_link_name) + 1;
 
-                if ((create_request_body_len = snprintf(create_request_body, create_request_nalloc,
-                                                        fmt_string, file_path, link_target)) < 0)
-                    FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
+                    if (NULL == (create_request_body = (char *)RV_malloc(create_request_nalloc)))
+                        FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTALLOC, FAIL,
+                                        "can't allocate space for link create request body");
 
-                if ((size_t)create_request_body_len >= create_request_nalloc)
-                    FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL,
-                                    "link create request body size exceeded allocated buffer size");
+                    if ((create_request_body_len =
+                             snprintf(create_request_body, create_request_nalloc, fmt_string_title,
+                                      escaped_link_name, file_path, link_target)) < 0)
+                        FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
+
+                    if ((size_t)create_request_body_len >= create_request_nalloc)
+                        FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL,
+                                        "link create request body size exceeded allocated buffer size");
+                }
+                else {
+                    /* Body does not contain link name */
+                    create_request_nalloc =
+                        (strlen(fmt_string_no_title) - 4) + strlen(file_path) + strlen(link_target) + 1;
+                    if (NULL == (create_request_body = (char *)RV_malloc(create_request_nalloc)))
+                        FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTALLOC, FAIL,
+                                        "can't allocate space for link create request body");
+
+                    if ((create_request_body_len = snprintf(create_request_body, create_request_nalloc,
+                                                            fmt_string_no_title, file_path, link_target)) < 0)
+                        FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
+
+                    if ((size_t)create_request_body_len >= create_request_nalloc)
+                        FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL,
+                                        "link create request body size exceeded allocated buffer size");
+                }
             }
 
 #ifdef RV_CONNECTOR_DEBUG
@@ -304,72 +392,43 @@ RV_link_create(H5VL_link_create_args_t *args, void *obj, const H5VL_loc_params_t
             FUNC_GOTO_ERROR(H5E_LINK, H5E_BADVALUE, FAIL, "Invalid link create type");
     } /* end switch */
 
-    /* Setup the host header */
-    host_header_len = strlen(new_link_loc_obj->domain->u.file.filepath_name) + strlen(host_string) + 1;
-    if (NULL == (host_header = (char *)RV_malloc(host_header_len)))
-        FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTALLOC, FAIL, "can't allocate space for request Host header");
+    if (SERVER_VERSION_SUPPORTS_LONG_NAMES(new_link_loc_obj->domain->u.file.server_info.version) &&
+        loc_params->loc_data.loc_by_name.name) {
+        /* Redirect cURL from the base URL to "/groups/<id>/links" to create the link */
+        if ((url_len =
+                 snprintf(request_endpoint, URL_MAX_LENGTH, "/groups/%s/links", new_link_loc_obj->URI)) < 0)
+            FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
+    }
+    else {
+        /* URL-encode the name of the link to ensure that the resulting URL for the link
+         * creation operation doesn't contain any illegal characters
+         */
+        if (NULL == (url_encoded_link_name =
+                         curl_easy_escape(curl, H5_rest_basename(loc_params->loc_data.loc_by_name.name), 0)))
+            FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTENCODE, FAIL, "can't URL-encode link name");
 
-    strcpy(host_header, host_string);
-
-    curl_headers =
-        curl_slist_append(curl_headers, strncat(host_header, new_link_loc_obj->domain->u.file.filepath_name,
-                                                host_header_len - strlen(host_string) - 1));
-
-    /* Disable use of Expect: 100 Continue HTTP response */
-    curl_headers = curl_slist_append(curl_headers, "Expect:");
-
-    /* Instruct cURL that we are sending JSON */
-    curl_headers = curl_slist_append(curl_headers, "Content-Type: application/json");
-
-    /* URL-encode the name of the link to ensure that the resulting URL for the link
-     * creation operation doesn't contain any illegal characters
-     */
-    if (NULL == (url_encoded_link_name =
-                     curl_easy_escape(curl, H5_rest_basename(loc_params->loc_data.loc_by_name.name), 0)))
-        FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTENCODE, FAIL, "can't URL-encode link name");
-
-    /* Redirect cURL from the base URL to "/groups/<id>/links/<name>" to create the link */
-    if ((url_len = snprintf(request_url, URL_MAX_LENGTH, "%s/groups/%s/links/%s", base_URL,
-                            new_link_loc_obj->URI, url_encoded_link_name)) < 0)
-        FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
+        /* Redirect cURL from the base URL to "/groups/<id>/links/<name>" to create the link */
+        if ((url_len = snprintf(request_endpoint, URL_MAX_LENGTH, "/groups/%s/links/%s",
+                                new_link_loc_obj->URI, url_encoded_link_name)) < 0)
+            FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
+    }
 
     if (url_len >= URL_MAX_LENGTH)
         FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "link create URL size exceeded maximum URL size");
 
 #ifdef RV_CONNECTOR_DEBUG
-    printf("-> Link create request URL: %s\n\n", request_url);
+    printf("-> Link create request URL: %s\n\n", request_endpoint);
 #endif
 
     uinfo.buffer      = create_request_body;
     uinfo.buffer_size = (size_t)create_request_body_len;
     uinfo.bytes_sent  = 0;
-    if (CURLE_OK !=
-        curl_easy_setopt(curl, CURLOPT_USERNAME, new_link_loc_obj->domain->u.file.server_info.username))
-        FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL username: %s", curl_err_buf);
-    if (CURLE_OK !=
-        curl_easy_setopt(curl, CURLOPT_PASSWORD, new_link_loc_obj->domain->u.file.server_info.password))
-        FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL password: %s", curl_err_buf);
-    if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_HTTPHEADER, curl_headers))
-        FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL HTTP headers: %s", curl_err_buf);
-    if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_UPLOAD, 1))
-        FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set up cURL to make HTTP PUT request: %s",
-                        curl_err_buf);
-    if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_READDATA, &uinfo))
-        FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL PUT data: %s", curl_err_buf);
-    if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)create_request_body_len))
-        FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL PUT data size: %s", curl_err_buf);
-    if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_URL, request_url))
-        FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL request URL: %s", curl_err_buf);
 
-#ifdef RV_CONNECTOR_DEBUG
-    printf("-> Creating link\n\n");
+    http_response = RV_curl_put(curl, &new_link_loc_obj->domain->u.file.server_info, request_endpoint,
+                                new_link_loc_obj->domain->u.file.filepath_name, &uinfo, CONTENT_TYPE_JSON);
 
-    printf("   /**********************************\\\n");
-    printf("-> | Making PUT request to the server |\n");
-    printf("   \\**********************************/\n\n");
-#endif
-
-    CURL_PERFORM(curl, H5E_LINK, H5E_CANTCREATE, FAIL);
+    if (!HTTP_SUCCESS(http_response))
+        FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTCREATE, FAIL, "can't create link");
 
 #ifdef RV_CONNECTOR_DEBUG
     printf("-> Created link\n\n");
@@ -382,19 +441,10 @@ done:
 
     if (create_request_body)
         RV_free(create_request_body);
-    if (host_header)
-        RV_free(host_header);
     if (url_encoded_link_name)
         curl_free(url_encoded_link_name);
-
-    /* Unset cURL UPLOAD option to ensure that future requests don't try to use PUT calls */
-    if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_UPLOAD, 0))
-        FUNC_DONE_ERROR(H5E_ATTR, H5E_CANTSET, FAIL, "can't unset cURL PUT option: %s", curl_err_buf);
-
-    if (curl_headers) {
-        curl_slist_free_all(curl_headers);
-        curl_headers = NULL;
-    } /* end if */
+    if (escaped_link_name)
+        RV_free(escaped_link_name);
 
     PRINT_ERROR_STACK;
 
@@ -473,13 +523,10 @@ RV_link_get(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link_get_args_t
 {
     RV_object_t *loc_obj = (RV_object_t *)obj;
     hbool_t      empty_dirname;
-    size_t       host_header_len       = 0;
-    const char  *base_URL              = NULL;
-    char        *host_header           = NULL;
     char        *link_dir_name         = NULL;
     char        *url_encoded_link_name = NULL;
     char         temp_URI[URI_MAX_LENGTH];
-    char         request_url[URL_MAX_LENGTH];
+    char         request_endpoint[URL_MAX_LENGTH];
     int          url_len   = 0;
     herr_t       ret_value = SUCCEED;
 
@@ -490,9 +537,6 @@ RV_link_get(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link_get_args_t
     printf("     - Link loc_obj's object type: %s\n", object_type_to_string(loc_obj->obj_type));
     printf("     - Link loc_obj's domain path: %s\n\n", loc_obj->domain->u.file.filepath_name);
 #endif
-
-    if ((base_URL = loc_obj->domain->u.file.server_info.base_URL) == NULL)
-        FUNC_GOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "location object does not have valid server URL");
 
     switch (args->op_type) {
         /* H5Lget_info */
@@ -541,7 +585,7 @@ RV_link_get(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link_get_args_t
                                      curl, H5_rest_basename(loc_params->loc_data.loc_by_name.name), 0)))
                         FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTENCODE, FAIL, "can't URL-encode link name");
 
-                    if ((url_len = snprintf(request_url, URL_MAX_LENGTH, "%s/groups/%s/links/%s", base_URL,
+                    if ((url_len = snprintf(request_endpoint, URL_MAX_LENGTH, "/groups/%s/links/%s",
                                             empty_dirname ? loc_obj->URI : temp_URI, url_encoded_link_name)) <
                         0)
                         FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
@@ -566,44 +610,9 @@ RV_link_get(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link_get_args_t
             } /* end switch */
 
             /* Make a GET request to the server to retrieve the number of attributes attached to the object */
-
-            /* Setup the host header */
-            host_header_len = strlen(loc_obj->domain->u.file.filepath_name) + strlen(host_string) + 1;
-            if (NULL == (host_header = (char *)RV_malloc(host_header_len)))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTALLOC, FAIL,
-                                "can't allocate space for request Host header");
-
-            strcpy(host_header, host_string);
-
-            curl_headers =
-                curl_slist_append(curl_headers, strncat(host_header, loc_obj->domain->u.file.filepath_name,
-                                                        host_header_len - strlen(host_string) - 1));
-
-            /* Disable use of Expect: 100 Continue HTTP response */
-            curl_headers = curl_slist_append(curl_headers, "Expect:");
-            if (CURLE_OK !=
-                curl_easy_setopt(curl, CURLOPT_USERNAME, loc_obj->domain->u.file.server_info.username))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL username: %s", curl_err_buf);
-            if (CURLE_OK !=
-                curl_easy_setopt(curl, CURLOPT_PASSWORD, loc_obj->domain->u.file.server_info.password))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL password: %s", curl_err_buf);
-            if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_HTTPHEADER, curl_headers))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL HTTP headers: %s", curl_err_buf);
-            if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_HTTPGET, 1))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set up cURL to make HTTP GET request: %s",
-                                curl_err_buf);
-            if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_URL, request_url))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL request URL: %s", curl_err_buf);
-
-#ifdef RV_CONNECTOR_DEBUG
-            printf("-> Retrieving link info at URL: %s\n\n", request_url);
-
-            printf("   /**********************************\\\n");
-            printf("-> | Making GET request to the server |\n");
-            printf("   \\**********************************/\n\n");
-#endif
-
-            CURL_PERFORM(curl, H5E_LINK, H5E_CANTGET, FAIL);
+            if (RV_curl_get(curl, &loc_obj->domain->u.file.server_info, request_endpoint,
+                            loc_obj->domain->u.file.filepath_name, CONTENT_TYPE_JSON) < 0)
+                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTGET, FAIL, "can't get link");
 
             /* Retrieve the link info */
             if (RV_parse_response(response_buffer.buffer, NULL, link_info, RV_get_link_info_callback) < 0)
@@ -620,6 +629,7 @@ RV_link_get(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link_get_args_t
             htri_t                search_ret;
             char                 *link_name_buf      = args->args.get_name.name;
             size_t                link_name_buf_size = args->args.get_name.name_size;
+            size_t                idx_p              = 0;
             size_t               *ret_size           = args->args.get_name.name_len;
 
             /*
@@ -636,10 +646,12 @@ RV_link_get(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link_get_args_t
             by_idx_data.is_recursive               = FALSE;
             by_idx_data.index_type                 = loc_params->loc_data.loc_by_idx.idx_type;
             by_idx_data.iter_order                 = loc_params->loc_data.loc_by_idx.order;
-            by_idx_data.idx_p                      = &loc_params->loc_data.loc_by_idx.n;
             by_idx_data.iter_function.link_iter_op = NULL;
             by_idx_data.op_data                    = NULL;
             by_idx_data.iter_obj_parent            = loc_obj;
+            idx_p                                  = loc_params->loc_data.loc_by_idx.n;
+            by_idx_data.idx_p                      = &idx_p;
+
             /*
              * Setup information to be passed back from link name retrieval callback
              */
@@ -654,8 +666,7 @@ RV_link_get(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link_get_args_t
             if (!search_ret || search_ret < 0)
                 FUNC_GOTO_ERROR(H5E_SYM, H5E_PATH, FAIL, "can't locate group");
 
-            if ((url_len = snprintf(request_url, URL_MAX_LENGTH, "%s/groups/%s/links", base_URL, temp_URI)) <
-                0)
+            if ((url_len = snprintf(request_endpoint, URL_MAX_LENGTH, "/groups/%s/links", temp_URI)) < 0)
                 FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
 
             if (url_len >= URL_MAX_LENGTH)
@@ -663,45 +674,9 @@ RV_link_get(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link_get_args_t
                                 "H5Lget_name_by_idx request URL size exceeded maximum URL size");
 
             /* Make a GET request to the server to retrieve all of the links in the given group */
-
-            /* Setup the host header */
-            host_header_len = strlen(loc_obj->domain->u.file.filepath_name) + strlen(host_string) + 1;
-            if (NULL == (host_header = (char *)RV_malloc(host_header_len)))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTALLOC, FAIL,
-                                "can't allocate space for request Host header");
-
-            strcpy(host_header, host_string);
-
-            curl_headers =
-                curl_slist_append(curl_headers, strncat(host_header, loc_obj->domain->u.file.filepath_name,
-                                                        host_header_len - strlen(host_string) - 1));
-
-            /* Disable use of Expect: 100 Continue HTTP response */
-            curl_headers = curl_slist_append(curl_headers, "Expect:");
-
-            if (CURLE_OK !=
-                curl_easy_setopt(curl, CURLOPT_USERNAME, loc_obj->domain->u.file.server_info.username))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL username: %s", curl_err_buf);
-            if (CURLE_OK !=
-                curl_easy_setopt(curl, CURLOPT_PASSWORD, loc_obj->domain->u.file.server_info.password))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL password: %s", curl_err_buf);
-            if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_HTTPHEADER, curl_headers))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL HTTP headers: %s", curl_err_buf);
-            if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_HTTPGET, 1))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set up cURL to make HTTP GET request: %s",
-                                curl_err_buf);
-            if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_URL, request_url))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL request URL: %s", curl_err_buf);
-
-#ifdef RV_CONNECTOR_DEBUG
-            printf("-> Retrieving all links in group using URL: %s\n\n", request_url);
-
-            printf("   /**********************************\\\n");
-            printf("-> | Making GET request to the server |\n");
-            printf("   \\**********************************/\n\n");
-#endif
-
-            CURL_PERFORM(curl, H5E_LINK, H5E_CANTGET, FAIL);
+            if (RV_curl_get(curl, &loc_obj->domain->u.file.server_info, request_endpoint,
+                            loc_obj->domain->u.file.filepath_name, CONTENT_TYPE_JSON) < 0)
+                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTGET, FAIL, "can't get link");
 
             if (RV_parse_response(response_buffer.buffer, &by_idx_data, &link_name_data,
                                   RV_get_link_name_by_idx_callback) < 0)
@@ -759,7 +734,7 @@ RV_link_get(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link_get_args_t
                                      curl, H5_rest_basename(loc_params->loc_data.loc_by_name.name), 0)))
                         FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTENCODE, FAIL, "can't URL-encode link name");
 
-                    if ((url_len = snprintf(request_url, URL_MAX_LENGTH, "%s/groups/%s/links/%s", base_URL,
+                    if ((url_len = snprintf(request_endpoint, URL_MAX_LENGTH, "/groups/%s/links/%s",
                                             empty_dirname ? loc_obj->URI : temp_URI, url_encoded_link_name)) <
                         0)
                         FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
@@ -784,48 +759,17 @@ RV_link_get(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link_get_args_t
             } /* end switch */
 
             /* Make a GET request to the server to retrieve the number of attributes attached to the object */
-
-            /* Setup the host header */
-            host_header_len = strlen(loc_obj->domain->u.file.filepath_name) + strlen(host_string) + 1;
-            if (NULL == (host_header = (char *)RV_malloc(host_header_len)))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTALLOC, FAIL,
-                                "can't allocate space for request Host header");
-
-            strcpy(host_header, host_string);
-
-            curl_headers =
-                curl_slist_append(curl_headers, strncat(host_header, loc_obj->domain->u.file.filepath_name,
-                                                        host_header_len - strlen(host_string) - 1));
-
-            /* Disable use of Expect: 100 Continue HTTP response */
-            curl_headers = curl_slist_append(curl_headers, "Expect:");
-
-            if (CURLE_OK !=
-                curl_easy_setopt(curl, CURLOPT_USERNAME, loc_obj->domain->u.file.server_info.username))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL username: %s", curl_err_buf);
-            if (CURLE_OK !=
-                curl_easy_setopt(curl, CURLOPT_PASSWORD, loc_obj->domain->u.file.server_info.password))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL password: %s", curl_err_buf);
-            if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_HTTPHEADER, curl_headers))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL HTTP headers: %s", curl_err_buf);
-            if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_HTTPGET, 1))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set up cURL to make HTTP GET request: %s",
-                                curl_err_buf);
-            if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_URL, request_url))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL request URL: %s", curl_err_buf);
-
-#ifdef RV_CONNECTOR_DEBUG
-            printf("-> Retrieving link value from URL: %s\n\n", request_url);
-
-            printf("   /**********************************\\\n");
-            printf("-> | Making GET request to the server |\n");
-            printf("   \\**********************************/\n\n");
-#endif
-
-            CURL_PERFORM(curl, H5E_LINK, H5E_CANTGET, FAIL);
+            if (RV_curl_get(curl, &loc_obj->domain->u.file.server_info, request_endpoint,
+                            loc_obj->domain->u.file.filepath_name, CONTENT_TYPE_JSON) < 0)
+                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTGET, FAIL, "can't get link");
 
             /* Retrieve the link value */
-            if (RV_parse_response(response_buffer.buffer, &buf_size, out_buf, RV_get_link_val_callback) < 0)
+            get_link_val_out get_link_val_args;
+            get_link_val_args.in_buf_size = &buf_size;
+            get_link_val_args.buf         = out_buf;
+
+            if (RV_parse_response(response_buffer.buffer, NULL, &get_link_val_args,
+                                  RV_get_link_val_callback) < 0)
                 FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTGET, FAIL, "can't retrieve link value");
 
             break;
@@ -840,17 +784,10 @@ done:
     printf("-> Link get response buffer:\n%s\n\n", response_buffer.buffer);
 #endif
 
-    if (host_header)
-        RV_free(host_header);
     if (url_encoded_link_name)
         curl_free(url_encoded_link_name);
     if (link_dir_name)
         RV_free(link_dir_name);
-
-    if (curl_headers) {
-        curl_slist_free_all(curl_headers);
-        curl_headers = NULL;
-    } /* end if */
 
     PRINT_ERROR_STACK;
 
@@ -874,17 +811,19 @@ RV_link_specific(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link_speci
 {
     RV_object_t *loc_obj = (RV_object_t *)obj;
     hbool_t      empty_dirname;
-    size_t       host_header_len        = 0;
+    size_t       escaped_link_size      = 0;
+    int          request_body_len       = 0;
     hid_t        link_iter_group_id     = H5I_INVALID_HID;
     void        *link_iter_group_object = NULL;
-    const char  *base_URL               = NULL;
-    char        *host_header            = NULL;
     char        *link_path_dirname      = NULL;
     char         temp_URI[URI_MAX_LENGTH];
-    char         request_url[URL_MAX_LENGTH];
+    char         request_endpoint[URL_MAX_LENGTH];
     char        *url_encoded_link_name = NULL;
+    char        *escaped_link_name     = NULL;
+    char        *request_body          = NULL;
     int          url_len               = 0;
-    herr_t       ret_value             = SUCCEED;
+    long         http_response;
+    herr_t       ret_value = SUCCEED;
 
 #ifdef RV_CONNECTOR_DEBUG
     printf("-> Received link-specific call with following parameters:\n");
@@ -896,9 +835,6 @@ RV_link_specific(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link_speci
 
     if (H5I_FILE != loc_obj->obj_type && H5I_GROUP != loc_obj->obj_type)
         FUNC_GOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "parent object not a file or group");
-
-    if ((base_URL = loc_obj->domain->u.file.server_info.base_URL) == NULL)
-        FUNC_GOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "location object does not have valid server URL");
 
     switch (args->op_type) {
         /* H5Ldelete */
@@ -938,7 +874,7 @@ RV_link_specific(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link_speci
                         FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTENCODE, FAIL, "can't URL-encode link name");
 
                     /* Redirect cURL from the base URL to "/groups/<id>/links/<name>" to delete link */
-                    if ((url_len = snprintf(request_url, URL_MAX_LENGTH, "%s/groups/%s/links/%s", base_URL,
+                    if ((url_len = snprintf(request_endpoint, URL_MAX_LENGTH, "/groups/%s/links/%s",
                                             empty_dirname ? loc_obj->URI : temp_URI, url_encoded_link_name)) <
                         0)
                         FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
@@ -962,46 +898,11 @@ RV_link_specific(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link_speci
                     FUNC_GOTO_ERROR(H5E_LINK, H5E_BADVALUE, FAIL, "invalid loc_params type");
             } /* end switch */
 
-            /* Setup cURL to make the DELETE request */
+            http_response = RV_curl_delete(curl, &loc_obj->domain->u.file.server_info, request_endpoint,
+                                           (const char *)loc_obj->domain->u.file.filepath_name);
 
-            /* Setup the host header */
-            host_header_len = strlen(loc_obj->domain->u.file.filepath_name) + strlen(host_string) + 1;
-            if (NULL == (host_header = (char *)RV_malloc(host_header_len)))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTALLOC, FAIL,
-                                "can't allocate space for request Host header");
-
-            strcpy(host_header, host_string);
-
-            curl_headers =
-                curl_slist_append(curl_headers, strncat(host_header, loc_obj->domain->u.file.filepath_name,
-                                                        host_header_len - strlen(host_string) - 1));
-
-            /* Disable use of Expect: 100 Continue HTTP response */
-            curl_headers = curl_slist_append(curl_headers, "Expect:");
-
-            if (CURLE_OK !=
-                curl_easy_setopt(curl, CURLOPT_USERNAME, loc_obj->domain->u.file.server_info.username))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL username: %s", curl_err_buf);
-            if (CURLE_OK !=
-                curl_easy_setopt(curl, CURLOPT_PASSWORD, loc_obj->domain->u.file.server_info.password))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL password: %s", curl_err_buf);
-            if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_HTTPHEADER, curl_headers))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL HTTP headers: %s", curl_err_buf);
-            if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE"))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL,
-                                "can't set up cURL to make HTTP DELETE request: %s", curl_err_buf);
-            if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_URL, request_url))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL request URL: %s", curl_err_buf);
-
-#ifdef RV_CONNECTOR_DEBUG
-            printf("-> Deleting link using URL: %s\n\n", request_url);
-
-            printf("   /*************************************\\\n");
-            printf("-> | Making DELETE request to the server |\n");
-            printf("   \\*************************************/\n\n");
-#endif
-
-            CURL_PERFORM(curl, H5E_LINK, H5E_CANTREMOVE, FAIL);
+            if (!HTTP_SUCCESS(http_response))
+                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTREMOVE, FAIL, "can't delete link");
 
             break;
         } /* H5VL_LINK_DELETE */
@@ -1009,7 +910,6 @@ RV_link_specific(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link_speci
         /* H5Lexists */
         case H5VL_LINK_EXISTS: {
             hbool_t *ret = args->args.exists.exists;
-            long     http_response;
 
             /* In case the user specified a path which contains multiple groups on the way to the
              * link in question, extract out the path to the final group in the chain */
@@ -1031,64 +931,87 @@ RV_link_specific(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link_speci
                     FUNC_GOTO_ERROR(H5E_LINK, H5E_PATH, FAIL, "can't locate parent group for link");
             } /* end if */
 
-            /* URL-encode the link name so that the resulting URL for the link GET
-             * operation doesn't contain any illegal characters
-             */
-            if (NULL == (url_encoded_link_name = curl_easy_escape(
-                             curl, H5_rest_basename(loc_params->loc_data.loc_by_name.name), 0)))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTENCODE, FAIL, "can't URL-encode link name");
+            /* Setup cURL to make the request */
+            if (SERVER_VERSION_SUPPORTS_LONG_NAMES(loc_obj->domain->u.file.server_info.version)) {
+                /* Send link name in body of POST request */
+                const char *fmt_string = "{\"titles\": [\"%s\"]}";
+                int         bytes_printed;
 
-            if ((url_len = snprintf(request_url, URL_MAX_LENGTH, "%s/groups/%s/links/%s", base_URL,
-                                    empty_dirname ? loc_obj->URI : temp_URI, url_encoded_link_name)) < 0)
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
+                /* JSON escape link name */
+                if (RV_JSON_escape_string(H5_rest_basename(loc_params->loc_data.loc_by_name.name),
+                                          escaped_link_name, &escaped_link_size) < 0)
+                    FUNC_GOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "can't get size of JSON escaped link name");
+
+                if ((escaped_link_name = RV_malloc(escaped_link_size)) < 0)
+                    FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTALLOC, FAIL,
+                                    "can't allocate space for escaped link name");
+
+                if (RV_JSON_escape_string(H5_rest_basename(loc_params->loc_data.loc_by_name.name),
+                                          escaped_link_name, &escaped_link_size) < 0)
+                    FUNC_GOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "can't JSON escape link name");
+
+                request_body_len = (int)(strlen(fmt_string) - 2 + strlen(escaped_link_name) + 1);
+
+                if ((request_body = RV_malloc((size_t)request_body_len)) == NULL)
+                    FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTALLOC, FAIL,
+                                    "can't allocate space for link query body");
+
+                if ((bytes_printed =
+                         snprintf(request_body, (size_t)request_body_len, fmt_string, escaped_link_name)) < 0)
+                    FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
+
+                if (bytes_printed >= request_body_len)
+                    FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL,
+                                    "request body size exceeded allocated buffer size");
+
+                if ((url_len = snprintf(request_endpoint, URL_MAX_LENGTH, "/groups/%s/links",
+                                        empty_dirname ? loc_obj->URI : temp_URI)) < 0)
+                    FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
+
+#ifdef RV_CONNECTOR_DEBUG
+                printf("-> Checking for existence of link using endpoint: %s\n\n", request_endpoint);
+#endif
+
+                if ((http_response = RV_curl_post(curl, &loc_obj->domain->u.file.server_info,
+                                                  request_endpoint, loc_obj->domain->u.file.filepath_name,
+                                                  request_body, (size_t)bytes_printed, CONTENT_TYPE_JSON)) <
+                    0)
+                    FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTGET, FAIL,
+                                    "internal failure while making POST request to server");
+            }
+            else {
+                /* URL-encode the link name so that the resulting URL for the link GET
+                 * operation doesn't contain any illegal characters
+                 */
+                if (NULL == (url_encoded_link_name = curl_easy_escape(
+                                 curl, H5_rest_basename(loc_params->loc_data.loc_by_name.name), 0)))
+                    FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTENCODE, FAIL, "can't URL-encode link name");
+
+                if ((url_len = snprintf(request_endpoint, URL_MAX_LENGTH, "/groups/%s/links/%s",
+                                        empty_dirname ? loc_obj->URI : temp_URI, url_encoded_link_name)) < 0)
+                    FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
+
+#ifdef RV_CONNECTOR_DEBUG
+                printf("-> Checking for existence of link using endpoint: %s\n\n", request_endpoint);
+#endif
+                if ((http_response = RV_curl_get(curl, &loc_obj->domain->u.file.server_info, request_endpoint,
+                                                 loc_obj->domain->u.file.filepath_name, CONTENT_TYPE_JSON)) <
+                    0)
+                    FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTGET, FAIL,
+                                    "internal failure while making GET request to server");
+            }
 
             if (url_len >= URL_MAX_LENGTH)
                 FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL,
                                 "H5Lexists request URL size exceeded maximum URL size");
 
-            /* Setup cURL to make the GET request */
+            if (HTTP_CLIENT_ERROR(http_response) && http_response != 404 && http_response != 410)
+                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTGET, FAIL, "malformed client request: response code %zu\n",
+                                http_response);
 
-            /* Setup the host header */
-            host_header_len = strlen(loc_obj->domain->u.file.filepath_name) + strlen(host_string) + 1;
-            if (NULL == (host_header = (char *)RV_malloc(host_header_len)))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTALLOC, FAIL,
-                                "can't allocate space for request Host header");
-
-            strcpy(host_header, host_string);
-
-            curl_headers =
-                curl_slist_append(curl_headers, strncat(host_header, loc_obj->domain->u.file.filepath_name,
-                                                        host_header_len - strlen(host_string) - 1));
-
-            /* Disable use of Expect: 100 Continue HTTP response */
-            curl_headers = curl_slist_append(curl_headers, "Expect:");
-
-            if (CURLE_OK !=
-                curl_easy_setopt(curl, CURLOPT_USERNAME, loc_obj->domain->u.file.server_info.username))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL username: %s", curl_err_buf);
-            if (CURLE_OK !=
-                curl_easy_setopt(curl, CURLOPT_PASSWORD, loc_obj->domain->u.file.server_info.password))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL password: %s", curl_err_buf);
-            if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_HTTPHEADER, curl_headers))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL HTTP headers: %s", curl_err_buf);
-            if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_HTTPGET, 1))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set up cURL to make HTTP GET request: %s",
-                                curl_err_buf);
-            if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_URL, request_url))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL request URL: %s", curl_err_buf);
-
-#ifdef RV_CONNECTOR_DEBUG
-            printf("-> Checking for existence of link using URL: %s\n\n", request_url);
-
-            printf("   /**********************************\\\n");
-            printf("-> | Making GET request to the server |\n");
-            printf("   \\**********************************/\n\n");
-#endif
-
-            CURL_PERFORM_NO_ERR(curl, FAIL);
-
-            if (CURLE_OK != curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_response))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTGET, FAIL, "can't get HTTP response code");
+            if (HTTP_SERVER_ERROR(http_response))
+                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTGET, FAIL, "internal server failure: response code %zu\n",
+                                http_response);
 
             *ret = HTTP_SUCCESS(http_response);
 
@@ -1125,7 +1048,7 @@ RV_link_specific(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link_speci
                                      RV_group_open(loc_obj, loc_params, ".", H5P_DEFAULT, H5P_DEFAULT, NULL)))
                         FUNC_GOTO_ERROR(H5E_SYM, H5E_CANTOPENOBJ, FAIL, "can't open link iteration group");
 
-                    if ((url_len = snprintf(request_url, URL_MAX_LENGTH, "%s/groups/%s/links", base_URL,
+                    if ((url_len = snprintf(request_endpoint, URL_MAX_LENGTH, "/groups/%s/links",
                                             loc_obj->URI)) < 0)
                         FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
 
@@ -1155,7 +1078,7 @@ RV_link_specific(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link_speci
                                                    H5P_DEFAULT, H5P_DEFAULT, NULL)))
                         FUNC_GOTO_ERROR(H5E_SYM, H5E_CANTOPENOBJ, FAIL, "can't open link iteration group");
 
-                    if ((url_len = snprintf(request_url, URL_MAX_LENGTH, "%s/groups/%s/links", base_URL,
+                    if ((url_len = snprintf(request_endpoint, URL_MAX_LENGTH, "/groups/%s/links",
                                             ((RV_object_t *)link_iter_group_object)->URI)) < 0)
                         FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
 
@@ -1199,45 +1122,9 @@ RV_link_specific(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link_speci
             link_iter_data.iter_obj_id = link_iter_group_id;
 
             /* Make a GET request to the server to retrieve all of the links in the given group */
-
-            /* Setup the host header */
-            host_header_len = strlen(loc_obj->domain->u.file.filepath_name) + strlen(host_string) + 1;
-            if (NULL == (host_header = (char *)RV_malloc(host_header_len)))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTALLOC, FAIL,
-                                "can't allocate space for request Host header");
-
-            strcpy(host_header, host_string);
-
-            curl_headers =
-                curl_slist_append(curl_headers, strncat(host_header, loc_obj->domain->u.file.filepath_name,
-                                                        host_header_len - strlen(host_string) - 1));
-
-            /* Disable use of Expect: 100 Continue HTTP response */
-            curl_headers = curl_slist_append(curl_headers, "Expect:");
-
-            if (CURLE_OK !=
-                curl_easy_setopt(curl, CURLOPT_USERNAME, loc_obj->domain->u.file.server_info.username))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL username: %s", curl_err_buf);
-            if (CURLE_OK !=
-                curl_easy_setopt(curl, CURLOPT_PASSWORD, loc_obj->domain->u.file.server_info.password))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL password: %s", curl_err_buf);
-            if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_HTTPHEADER, curl_headers))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL HTTP headers: %s", curl_err_buf);
-            if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_HTTPGET, 1))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set up cURL to make HTTP GET request: %s",
-                                curl_err_buf);
-            if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_URL, request_url))
-                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL request URL: %s", curl_err_buf);
-
-#ifdef RV_CONNECTOR_DEBUG
-            printf("-> Retrieving all links in group using URL: %s\n\n", request_url);
-
-            printf("   /**********************************\\\n");
-            printf("-> | Making GET request to the server |\n");
-            printf("   \\**********************************/\n\n");
-#endif
-
-            CURL_PERFORM(curl, H5E_LINK, H5E_CANTGET, FAIL);
+            if (RV_curl_get(curl, &loc_obj->domain->u.file.server_info, request_endpoint,
+                            loc_obj->domain->u.file.filepath_name, CONTENT_TYPE_JSON) < 0)
+                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTGET, FAIL, "can't get link");
 
             if (RV_parse_response(response_buffer.buffer, &link_iter_data, NULL, RV_link_iter_callback) < 0)
                 FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTGET, FAIL, "can't iterate over links");
@@ -1253,27 +1140,19 @@ RV_link_specific(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link_speci
 done:
     if (link_path_dirname)
         RV_free(link_path_dirname);
-    if (host_header)
-        RV_free(host_header);
 
     if (link_iter_group_id >= 0)
         if (H5Gclose(link_iter_group_id) < 0)
             FUNC_DONE_ERROR(H5E_LINK, H5E_CANTCLOSEOBJ, FAIL, "can't close link iteration group");
 
-    /* In case a custom DELETE request was made, reset the request to NULL
-     * to prevent any possible future issues with requests
-     */
-    if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, NULL))
-        FUNC_DONE_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't reset cURL custom request: %s", curl_err_buf);
-
     /* Free the escaped portion of the URL */
     if (url_encoded_link_name)
         curl_free(url_encoded_link_name);
 
-    if (curl_headers) {
-        curl_slist_free_all(curl_headers);
-        curl_headers = NULL;
-    } /* end if */
+    if (escaped_link_name)
+        RV_free(escaped_link_name);
+    if (request_body)
+        RV_free(request_body);
 
     PRINT_ERROR_STACK;
 
@@ -1299,7 +1178,7 @@ done:
  *              December, 2017
  */
 herr_t
-RV_get_link_info_callback(char *HTTP_response, void *callback_data_in, void *callback_data_out)
+RV_get_link_info_callback(char *HTTP_response, const void *callback_data_in, void *callback_data_out)
 {
     H5L_info2_t *link_info  = (H5L_info2_t *)callback_data_out;
     yajl_val     parse_tree = NULL, key_obj;
@@ -1349,7 +1228,11 @@ RV_get_link_info_callback(char *HTTP_response, void *callback_data_in, void *cal
      * to the size of a soft, external or user-defined link's value, including the NULL terminator
      */
     if (strcmp(parsed_string, "H5L_TYPE_HARD")) {
-        if (RV_parse_response(HTTP_response, &link_info->u.val_size, NULL, RV_get_link_val_callback) < 0)
+        get_link_val_out get_link_val_args;
+        get_link_val_args.in_buf_size = &link_info->u.val_size;
+        get_link_val_args.buf         = NULL;
+
+        if (RV_parse_response(HTTP_response, NULL, &get_link_val_args, RV_get_link_val_callback) < 0)
             FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTGET, FAIL, "can't retrieve link value size");
 
 #ifdef RV_CONNECTOR_DEBUG
@@ -1397,14 +1280,15 @@ done:
  *              December, 2017
  */
 herr_t
-RV_get_link_val_callback(char *HTTP_response, void *callback_data_in, void *callback_data_out)
+RV_get_link_val_callback(char *HTTP_response, const void *callback_data_in, void *callback_data_out)
 {
-    yajl_val parse_tree  = NULL, key_obj;
-    size_t  *in_buf_size = (size_t *)callback_data_in;
-    char    *link_path;
-    char    *link_class;
-    char    *out_buf   = (char *)callback_data_out;
-    herr_t   ret_value = SUCCEED;
+    yajl_val          parse_tree        = NULL, key_obj;
+    get_link_val_out *get_link_val_args = (get_link_val_out *)callback_data_out;
+    size_t           *in_buf_size       = get_link_val_args->in_buf_size;
+    char             *link_path;
+    char             *link_class;
+    char             *out_buf   = get_link_val_args->buf;
+    herr_t            ret_value = SUCCEED;
 
 #ifdef RV_CONNECTOR_DEBUG
     printf("-> Retrieving link's value from server's HTTP response\n\n");
@@ -1546,7 +1430,7 @@ done:
  *              September, 2017
  */
 herr_t
-RV_get_link_obj_type_callback(char *HTTP_response, void *callback_data_in, void *callback_data_out)
+RV_get_link_obj_type_callback(char *HTTP_response, const void *callback_data_in, void *callback_data_out)
 {
     H5I_type_t *obj_type   = (H5I_type_t *)callback_data_out;
     yajl_val    parse_tree = NULL, key_obj;
@@ -1639,11 +1523,11 @@ done:
  *              November, 2018
  */
 static herr_t
-RV_get_link_name_by_idx_callback(char *HTTP_response, void *callback_data_in, void *callback_data_out)
+RV_get_link_name_by_idx_callback(char *HTTP_response, const void *callback_data_in, void *callback_data_out)
 {
     link_name_by_idx_data *link_name_data = (link_name_by_idx_data *)callback_data_out;
     link_table_entry      *link_table     = NULL;
-    iter_data             *by_idx_data    = (iter_data *)callback_data_in;
+    const iter_data       *by_idx_data    = (const iter_data *)callback_data_in;
     size_t                 link_table_num_entries;
     int (*link_table_sort_func)(const void *, const void *);
     herr_t ret_value = SUCCEED;
@@ -1682,8 +1566,7 @@ RV_get_link_name_by_idx_callback(char *HTTP_response, void *callback_data_in, vo
 #endif
 
     if (RV_build_link_table(HTTP_response, by_idx_data->is_recursive, link_table_sort_func, &link_table,
-                            &link_table_num_entries, NULL,
-                            by_idx_data->iter_obj_parent->domain->u.file.server_info.base_URL) < 0)
+                            &link_table_num_entries, NULL, by_idx_data->iter_obj_parent) < 0)
         FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTBUILDLINKTABLE, FAIL, "can't build link table");
 
     /* Check to make sure the index given is within bounds */
@@ -1741,11 +1624,11 @@ done:
  *              December, 2017
  */
 static herr_t
-RV_link_iter_callback(char *HTTP_response, void *callback_data_in, void *callback_data_out)
+RV_link_iter_callback(char *HTTP_response, const void *callback_data_in, void *callback_data_out)
 {
     link_table_entry *link_table         = NULL;
     rv_hash_table_t  *visited_link_table = NULL;
-    iter_data        *link_iter_data     = (iter_data *)callback_data_in;
+    const iter_data  *link_iter_data     = (const iter_data *)callback_data_in;
     size_t            link_table_num_entries;
     herr_t            ret_value = SUCCEED;
 
@@ -1782,8 +1665,7 @@ RV_link_iter_callback(char *HTTP_response, void *callback_data_in, void *callbac
          */
         if (RV_build_link_table(HTTP_response, link_iter_data->is_recursive,
                                 H5_rest_cmp_links_by_creation_order_inc, &link_table, &link_table_num_entries,
-                                visited_link_table,
-                                link_iter_data->iter_obj_parent->domain->u.file.server_info.base_URL) < 0)
+                                visited_link_table, link_iter_data->iter_obj_parent) < 0)
             FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTBUILDLINKTABLE, FAIL, "can't build link table");
 
 #ifdef RV_CONNECTOR_DEBUG
@@ -1793,7 +1675,7 @@ RV_link_iter_callback(char *HTTP_response, void *callback_data_in, void *callbac
     else {
         if (RV_build_link_table(HTTP_response, link_iter_data->is_recursive, NULL, &link_table,
                                 &link_table_num_entries, visited_link_table,
-                                link_iter_data->iter_obj_parent->domain->u.file.server_info.base_URL) < 0)
+                                link_iter_data->iter_obj_parent) < 0)
             FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTBUILDLINKTABLE, FAIL, "can't build link table");
     } /* end else */
 
@@ -1847,7 +1729,7 @@ done:
 static herr_t
 RV_build_link_table(char *HTTP_response, hbool_t is_recursive, int (*sort_func)(const void *, const void *),
                     link_table_entry **link_table, size_t *num_entries, rv_hash_table_t *visited_link_table,
-                    const char *base_URL)
+                    RV_object_t *loc_obj)
 {
     link_table_entry *table      = NULL;
     yajl_val          parse_tree = NULL, key_obj;
@@ -1857,7 +1739,7 @@ RV_build_link_table(char *HTTP_response, hbool_t is_recursive, int (*sort_func)(
     char             *visit_buffer = NULL;
     char             *link_section_start, *link_section_end;
     char             *url_encoded_link_name = NULL;
-    char              request_url[URL_MAX_LENGTH];
+    char              request_endpoint[URL_MAX_LENGTH];
     herr_t            ret_value = SUCCEED;
 
     if (!HTTP_response)
@@ -2020,7 +1902,7 @@ RV_build_link_table(char *HTTP_response, hbool_t is_recursive, int (*sort_func)(
                                      curl, H5_rest_basename(YAJL_GET_STRING(link_field_obj)), 0)))
                         FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTENCODE, FAIL, "can't URL-encode link name");
 
-                    if ((url_len = snprintf(request_url, URL_MAX_LENGTH, "%s/groups/%s/links", base_URL,
+                    if ((url_len = snprintf(request_endpoint, URL_MAX_LENGTH, "/groups/%s/links",
                                             url_encoded_link_name)) < 0)
                         FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
 
@@ -2028,23 +1910,13 @@ RV_build_link_table(char *HTTP_response, hbool_t is_recursive, int (*sort_func)(
                         FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL,
                                         "link GET request URL size exceeded maximum URL size");
 
-                    if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_URL, request_url))
-                        FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL request URL: %s",
-                                        curl_err_buf);
-
-#ifdef RV_CONNECTOR_DEBUG
-                    printf("-> Retrieving all links in subgroup using URL: %s\n\n", request_url);
-
-                    printf("   /**********************************\\\n");
-                    printf("-> | Making GET request to the server |\n");
-                    printf("   \\**********************************/\n\n");
-#endif
-
-                    CURL_PERFORM(curl, H5E_LINK, H5E_CANTGET, FAIL);
+                    if (RV_curl_get(curl, &loc_obj->domain->u.file.server_info, request_endpoint,
+                                    loc_obj->domain->u.file.filepath_name, CONTENT_TYPE_JSON) < 0)
+                        FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTGET, FAIL, "can't get link");
 
                     if (RV_build_link_table(response_buffer.buffer, is_recursive, sort_func,
                                             &table[i].subgroup.subgroup_link_table,
-                                            &table[i].subgroup.num_entries, visited_link_table, base_URL) < 0)
+                                            &table[i].subgroup.num_entries, visited_link_table, loc_obj) < 0)
                         FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTBUILDLINKTABLE, FAIL,
                                         "can't build link table for subgroup '%s'", table[i].link_name);
 
@@ -2125,7 +1997,7 @@ RV_free_link_table(link_table_entry *link_table, size_t num_entries)
  *              January, 2018
  */
 static herr_t
-RV_traverse_link_table(link_table_entry *link_table, size_t num_entries, iter_data *link_iter_data,
+RV_traverse_link_table(link_table_entry *link_table, size_t num_entries, const iter_data *link_iter_data,
                        const char *cur_link_rel_path)
 {
     static size_t depth = 0;

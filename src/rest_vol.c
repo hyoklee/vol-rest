@@ -41,7 +41,8 @@
  */
 hid_t H5_rest_id_g = H5I_UNINIT;
 
-static hbool_t H5_rest_initialized_g = FALSE;
+static hbool_t H5_rest_initialized_g      = FALSE;
+static hbool_t H5_rest_curl_initialized_g = FALSE;
 
 /* Identifiers for HDF5's error API */
 hid_t H5_rest_err_stack_g                 = H5I_INVALID_HID;
@@ -140,6 +141,13 @@ const char *attributes_keys[] = {"attributes", (const char *)0};
 /* JSON keys to retrieve allocated size */
 const char *allocated_size_keys[] = {"allocated_size", (const char *)0};
 
+/* JSON keys to retrieve information from a scan of a domain */
+const char *scan_info_keys[]       = {"scan_info", (const char *)0};
+const char *allocated_bytes_keys[] = {"allocated_bytes", (const char *)0};
+
+/* JSON keys to retrieve objects accessed through path(s) */
+const char *h5paths_keys[] = {"h5paths", (const char *)0};
+
 /* Default size for the buffer to allocate during base64-encoding if the caller
  * of RV_base64_encode supplies a 0-sized buffer.
  */
@@ -171,7 +179,7 @@ static size_t H5_rest_curl_write_data_callback(char *buffer, size_t size, size_t
 static char *H5_rest_url_encode_path(const char *path);
 
 /* Helper function to parse an object's type from server response */
-herr_t RV_parse_type(char *HTTP_response, void *callback_data_in, void *callback_data_out);
+herr_t RV_parse_object_class(char *HTTP_response, const void *callback_data_in, void *callback_data_out);
 
 /* Helper function to parse an object's creation properties from server response */
 herr_t RV_parse_creation_properties_callback(yajl_val parse_tree, char **GCPL_buf);
@@ -252,7 +260,7 @@ static const H5VL_class_t H5VL_rest_g = {
         RV_file_open,
         RV_file_get,
         RV_file_specific,
-        NULL,
+        RV_file_optional,
         RV_file_close,
     },
 
@@ -408,8 +416,10 @@ H5_rest_init(hid_t vipl_id)
 #endif
 
     /* Initialize cURL */
-    if (CURLE_OK != curl_global_init(CURL_GLOBAL_ALL))
+    if (!H5_rest_curl_initialized_g && (CURLE_OK != curl_global_init(CURL_GLOBAL_ALL)))
         FUNC_GOTO_ERROR(H5E_VOL, H5E_CANTINIT, FAIL, "can't initialize cURL");
+
+    H5_rest_curl_initialized_g = true;
 
     if (NULL == (curl = curl_easy_init()))
         FUNC_GOTO_ERROR(H5E_VOL, H5E_CANTINIT, FAIL, "can't initialize cURL easy handle");
@@ -897,6 +907,15 @@ H5_rest_set_connection_information(server_info_t *server_info)
 
             strcpy(server_info->base_URL, base_URL);
         }
+    }
+
+    /* TODO - Global curl handle is only used for dataset read/writes right now.
+     * Once that is removed, this will be unnecessary. */
+    if (username && password) {
+        if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_USERNAME, server_info->username))
+            FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_CANTSET, FAIL, "can't set cURL username: %s", curl_err_buf);
+        if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_PASSWORD, server_info->password))
+            FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_CANTSET, FAIL, "can't set cURL password: %s", curl_err_buf);
     }
 
 done:
@@ -1539,7 +1558,8 @@ H5_rest_url_encode_path(const char *_path)
     if (!_path)
         FUNC_GOTO_ERROR(H5E_ARGS, H5E_BADVALUE, NULL, "path was NULL");
 
-    path = (char *)_path;
+    /* Silence compiler const warnings */
+    memcpy(&path, &_path, sizeof(char *));
 
     /* Retrieve the length of the possible path prefix, which could be something like '/', '.', etc. */
     cur_pos = path;
@@ -1666,12 +1686,14 @@ done:
 
 /* Helper function to parse an object's type from server response */
 herr_t
-RV_parse_type(char *HTTP_response, void *callback_data_in, void *callback_data_out)
+RV_parse_object_class(char *HTTP_response, const void *callback_data_in, void *callback_data_out)
 {
-    yajl_val    parse_tree = NULL, key_obj;
+    yajl_val    parse_tree = NULL, key_obj = NULL, class_obj = NULL, target_tree = NULL;
     char       *parsed_object_string;
-    H5I_type_t *object_type = (H5I_type_t *)callback_data_out;
-    herr_t      ret_value   = SUCCEED;
+    const char *object_class_keys[] = {"class", (const char *)0};
+    const char *path_name           = NULL;
+    H5I_type_t *object_type         = (H5I_type_t *)callback_data_out;
+    herr_t      ret_value           = SUCCEED;
 
 #ifdef RV_CONNECTOR_DEBUG
     printf("-> Retrieving object's class from server's HTTP response\n\n");
@@ -1685,9 +1707,25 @@ RV_parse_type(char *HTTP_response, void *callback_data_in, void *callback_data_o
     if (NULL == (parse_tree = yajl_tree_parse(HTTP_response, NULL, 0)))
         FUNC_GOTO_ERROR(H5E_OBJECT, H5E_PARSEERROR, FAIL, "parsing JSON failed");
 
-    const char *object_class_keys[] = {"class", (const char *)0};
+    target_tree = parse_tree;
 
-    if (NULL == (key_obj = yajl_tree_get(parse_tree, object_class_keys, yajl_t_string))) {
+    /* If the response contains 'h5paths',
+     * it may describe multiple objects. Needs to be unwrapped first. */
+    if (NULL != yajl_tree_get(parse_tree, h5paths_keys, yajl_t_object)) {
+        if (NULL == (key_obj = yajl_tree_get(parse_tree, h5paths_keys, yajl_t_object)))
+            FUNC_GOTO_ERROR(H5E_OBJECT, H5E_PARSEERROR, FAIL, "can't parse h5paths object");
+
+        /* Access the first object under h5paths */
+        if (NULL == (path_name = key_obj->u.object.keys[0]))
+            FUNC_GOTO_ERROR(H5E_OBJECT, H5E_PARSEERROR, FAIL, "parsed path name was NULL");
+
+        const char *path_keys[] = {path_name, (const char *)0};
+
+        if (NULL == (target_tree = yajl_tree_get(key_obj, path_keys, yajl_t_object)))
+            FUNC_GOTO_ERROR(H5E_OBJECT, H5E_PARSEERROR, FAIL, "unable to parse object under path key");
+    }
+
+    if (NULL == (key_obj = yajl_tree_get(target_tree, object_class_keys, yajl_t_string))) {
         FUNC_GOTO_ERROR(H5E_OBJECT, H5E_PARSEERROR, FAIL, "couldn't parse object class");
     }
 
@@ -1715,7 +1753,7 @@ done:
         yajl_tree_free(parse_tree);
 
     return ret_value;
-} /* end RV_parse_type */
+} /* end RV_parse_object_class */
 
 /*---------------------------------------------------------------------------
  * Function:    H5_rest_get_conn_cls
@@ -1804,8 +1842,8 @@ done:
  *
  */
 herr_t
-RV_parse_response(char *HTTP_response, void *callback_data_in, void *callback_data_out,
-                  herr_t (*parse_callback)(char *, void *, void *))
+RV_parse_response(char *HTTP_response, const void *callback_data_in, void *callback_data_out,
+                  herr_t (*parse_callback)(char *, const void *, void *))
 {
     herr_t ret_value = SUCCEED;
 
@@ -1837,12 +1875,13 @@ done:
  *              July, 2017
  */
 herr_t
-RV_copy_object_URI_callback(char *HTTP_response, void *callback_data_in, void *callback_data_out)
+RV_copy_object_URI_callback(char *HTTP_response, const void *callback_data_in, void *callback_data_out)
 {
-    yajl_val parse_tree = NULL, key_obj;
-    char    *parsed_string;
-    char    *buf_out   = (char *)callback_data_out;
-    herr_t   ret_value = SUCCEED;
+    yajl_val    parse_tree = NULL, key_obj = NULL, single_obj = NULL, target_tree = NULL;
+    char       *parsed_string;
+    char       *buf_out   = (char *)callback_data_out;
+    const char *path_name = NULL;
+    herr_t      ret_value = SUCCEED;
 
 #ifdef RV_CONNECTOR_DEBUG
     printf("-> Retrieving object's URI from server's HTTP response\n\n");
@@ -1856,11 +1895,29 @@ RV_copy_object_URI_callback(char *HTTP_response, void *callback_data_in, void *c
     if (NULL == (parse_tree = yajl_tree_parse(HTTP_response, NULL, 0)))
         FUNC_GOTO_ERROR(H5E_OBJECT, H5E_PARSEERROR, FAIL, "parsing JSON failed");
 
+    target_tree = parse_tree;
+
+    /* If the response contains 'h5paths',
+     * it may describe multiple objects. Needs to be unwrapped first. */
+    if (NULL != yajl_tree_get(parse_tree, h5paths_keys, yajl_t_object)) {
+        if (NULL == (target_tree = yajl_tree_get(parse_tree, h5paths_keys, yajl_t_object)))
+            FUNC_GOTO_ERROR(H5E_OBJECT, H5E_PARSEERROR, FAIL, "can't parse h5paths object");
+
+        /* Access the first object under h5paths */
+        if (NULL == (path_name = target_tree->u.object.keys[0]))
+            FUNC_GOTO_ERROR(H5E_OBJECT, H5E_PARSEERROR, FAIL, "parsed path name was NULL");
+
+        const char *path_keys[] = {path_name, (const char *)0};
+
+        if (NULL == (target_tree = yajl_tree_get(target_tree, path_keys, yajl_t_object)))
+            FUNC_GOTO_ERROR(H5E_OBJECT, H5E_PARSEERROR, FAIL, "unable to parse object under path key");
+    }
+
     /* To handle the awkward case of soft and external links, which do not return an "ID",
      * first check for the link class field and short circuit if it is found to be
      * equal to "H5L_TYPE_SOFT"
      */
-    if (NULL != (key_obj = yajl_tree_get(parse_tree, link_class_keys, yajl_t_string))) {
+    if (NULL != (key_obj = yajl_tree_get(target_tree, link_class_keys, yajl_t_string))) {
         char *link_type;
 
         if (NULL == (link_type = YAJL_GET_STRING(key_obj)))
@@ -1874,7 +1931,7 @@ RV_copy_object_URI_callback(char *HTTP_response, void *callback_data_in, void *c
     /* First attempt to retrieve the URI of the object by using the JSON key sequence
      * "link" -> "id", which is returned when making a GET Link request.
      */
-    key_obj = yajl_tree_get(parse_tree, link_id_keys, yajl_t_string);
+    key_obj = yajl_tree_get(target_tree, link_id_keys, yajl_t_string);
     if (key_obj) {
         if (!YAJL_IS_STRING(key_obj))
             FUNC_GOTO_ERROR(H5E_OBJECT, H5E_BADVALUE, FAIL, "returned URI is not a string");
@@ -1896,7 +1953,7 @@ RV_copy_object_URI_callback(char *HTTP_response, void *callback_data_in, void *c
          * for just the JSON key "id", which would generally correspond to trying to
          * retrieve the URI of a newly-created or opened object that isn't a file.
          */
-        key_obj = yajl_tree_get(parse_tree, object_id_keys, yajl_t_string);
+        key_obj = yajl_tree_get(target_tree, object_id_keys, yajl_t_string);
         if (key_obj) {
             if (!YAJL_IS_STRING(key_obj))
                 FUNC_GOTO_ERROR(H5E_OBJECT, H5E_BADVALUE, FAIL, "returned URI is not a string");
@@ -1919,7 +1976,7 @@ RV_copy_object_URI_callback(char *HTTP_response, void *callback_data_in, void *c
              * retrieve the URI of a newly-created or opened file, or to a search for
              * the root group of a file.
              */
-            if (NULL == (key_obj = yajl_tree_get(parse_tree, root_id_keys, yajl_t_string)))
+            if (NULL == (key_obj = yajl_tree_get(target_tree, root_id_keys, yajl_t_string)))
                 FUNC_GOTO_ERROR(H5E_OBJECT, H5E_CANTGET, FAIL, "retrieval of URI failed");
 
             if (!YAJL_IS_STRING(key_obj))
@@ -1989,22 +2046,22 @@ done:
  */
 htri_t
 RV_find_object_by_path(RV_object_t *parent_obj, const char *obj_path, H5I_type_t *target_object_type,
-                       herr_t (*obj_found_callback)(char *, void *, void *), void *callback_data_in,
+                       herr_t (*obj_found_callback)(char *, const void *, void *), void *callback_data_in,
                        void *callback_data_out)
 {
-    RV_object_t       *external_file    = NULL;
-    hbool_t            is_relative_path = FALSE;
-    size_t             host_header_len  = 0;
+    RV_object_t       *external_file     = NULL;
+    hbool_t            is_relative_path  = FALSE;
+    size_t             escaped_path_size = 0;
     H5L_info2_t        link_info;
     char              *url_encoded_link_name = NULL;
-    char              *host_header           = NULL;
     char              *path_dirname          = NULL;
     char              *tmp_link_val          = NULL;
     char              *url_encoded_path_name = NULL;
     const char        *ext_filename          = NULL;
     const char        *ext_obj_path          = NULL;
-    const char        *base_URL;
-    char               request_url[URL_MAX_LENGTH];
+    char               request_endpoint[URL_MAX_LENGTH];
+    char              *escaped_obj_path = NULL;
+    char              *request_body     = NULL;
     long               http_response;
     int                url_len = 0;
     server_api_version version;
@@ -2020,8 +2077,7 @@ RV_find_object_by_path(RV_object_t *parent_obj, const char *obj_path, H5I_type_t
     if (H5I_FILE != parent_obj->obj_type && H5I_GROUP != parent_obj->obj_type &&
         H5I_DATATYPE != parent_obj->obj_type && H5I_DATASET != parent_obj->obj_type)
         FUNC_GOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "parent object not a file, group, datatype or dataset");
-    if ((base_URL = parent_obj->domain->u.file.server_info.base_URL) == NULL)
-        FUNC_GOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "parent object does not have valid server URL");
+
 #ifdef RV_CONNECTOR_DEBUG
     printf("-> Finding object by path '%s' from parent object of type %s with URI %s\n\n", obj_path,
            object_type_to_string(parent_obj->obj_type), parent_obj->URI);
@@ -2081,15 +2137,33 @@ RV_find_object_by_path(RV_object_t *parent_obj, const char *obj_path, H5I_type_t
     if (SERVER_VERSION_MATCHES_OR_EXCEEDS(version, 0, 8, 0)) {
 
         /* Set up request URL to make server do repeated traversal of symbolic links */
+        if (SERVER_VERSION_SUPPORTS_LONG_NAMES(version)) {
+            /* Send object path in body of POST request */
+            if (RV_JSON_escape_string(obj_path, escaped_obj_path, &escaped_path_size) < 0)
+                FUNC_GOTO_ERROR(H5E_LINK, H5E_BADVALUE, FAIL, "can't get size of escaped object path");
 
-        if (NULL == (url_encoded_path_name = H5_rest_url_encode_path(obj_path)))
-            FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTENCODE, FAIL, "can't URL-encode object path");
+            if ((escaped_obj_path = RV_malloc(escaped_path_size)) == NULL)
+                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTALLOC, FAIL, "can't allocate space for escaped path");
 
-        if ((url_len = snprintf(request_url, URL_MAX_LENGTH,
-                                "%s/?h5path=%s%s%s&follow_soft_links=1&follow_external_links=1", base_URL,
-                                url_encoded_path_name, is_relative_path ? "&parent_id=" : "",
-                                is_relative_path ? parent_obj->URI : "")) < 0)
-            FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
+            if (RV_JSON_escape_string(obj_path, escaped_obj_path, &escaped_path_size) < 0)
+                FUNC_GOTO_ERROR(H5E_LINK, H5E_BADVALUE, FAIL, "can't escape object path");
+
+            if ((url_len = snprintf(
+                     request_endpoint, URL_MAX_LENGTH, "/?follow_soft_links=1&follow_external_links=1%s%s",
+                     is_relative_path ? "&parent_id=" : "", is_relative_path ? parent_obj->URI : "")) < 0)
+                FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
+        }
+        else {
+            /* Send object path in URL of GET request */
+            if (NULL == (url_encoded_path_name = H5_rest_url_encode_path(obj_path)))
+                FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTENCODE, FAIL, "can't URL-encode object path");
+
+            if ((url_len = snprintf(request_endpoint, URL_MAX_LENGTH,
+                                    "/?h5path=%s%s%s&follow_soft_links=1&follow_external_links=1",
+                                    url_encoded_path_name, is_relative_path ? "&parent_id=" : "",
+                                    is_relative_path ? parent_obj->URI : "")) < 0)
+                FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
+        }
     }
     else {
         /* Server will not traverse symbolic links for us */
@@ -2135,7 +2209,7 @@ RV_find_object_by_path(RV_object_t *parent_obj, const char *obj_path, H5I_type_t
             if (NULL == (url_encoded_link_name = curl_easy_escape(curl, H5_rest_basename(obj_path), 0)))
                 FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTENCODE, FAIL, "can't URL-encode link name");
 
-            if ((url_len = snprintf(request_url, URL_MAX_LENGTH, "%s/groups/%s/links/%s", base_URL, pobj_URI,
+            if ((url_len = snprintf(request_endpoint, URL_MAX_LENGTH, "/groups/%s/links/%s", pobj_URI,
                                     url_encoded_link_name)) < 0)
                 FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
         }
@@ -2153,8 +2227,8 @@ RV_find_object_by_path(RV_object_t *parent_obj, const char *obj_path, H5I_type_t
 
             /* Handle the special case for the paths "." and "/" */
             if (!strcmp(obj_path, ".") || !strcmp(obj_path, "/")) {
-                if ((url_len = snprintf(request_url, URL_MAX_LENGTH, "%s/%s/%s", base_URL,
-                                        parent_obj_type_header, parent_obj->URI)) < 0)
+                if ((url_len = snprintf(request_endpoint, URL_MAX_LENGTH, "/%s/%s", parent_obj_type_header,
+                                        parent_obj->URI)) < 0)
                     FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
             }
             else {
@@ -2173,8 +2247,8 @@ RV_find_object_by_path(RV_object_t *parent_obj, const char *obj_path, H5I_type_t
                  *  [base_URL]/[object_type]/?h5path=[path_name]
                  */
                 if ((url_len = snprintf(
-                         request_url, URL_MAX_LENGTH, "%s/%s/%s?%s%s%sh5path=%s", base_URL,
-                         parent_obj_type_header, (is_relative_path && is_group) ? parent_obj->URI : "",
+                         request_endpoint, URL_MAX_LENGTH, "/%s/%s?%s%s%sh5path=%s", parent_obj_type_header,
+                         (is_relative_path && is_group) ? parent_obj->URI : "",
                          (is_relative_path && !is_group) ? "grpid=" : "",
                          (is_relative_path && !is_group) ? parent_obj->URI : "",
                          (is_relative_path && !is_group) ? "&" : "", url_encoded_path_name)) < 0)
@@ -2186,55 +2260,51 @@ RV_find_object_by_path(RV_object_t *parent_obj, const char *obj_path, H5I_type_t
     if (url_len >= URL_MAX_LENGTH)
         FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "Request URL size exceeded maximum URL size");
 
-    /* Setup cURL for making GET requests */
+    /* Make POST request that supports long paths if server supports it.
+       Otherwise, make GET request */
+    if (SERVER_VERSION_SUPPORTS_LONG_NAMES(version)) {
+        const char *fmt_string       = "{\"h5paths\": [\"%s\"]}";
+        size_t      request_body_len = 0;
+        int         bytes_printed    = 0;
 
-    /* Setup the host header */
-    host_header_len = strlen(parent_obj->domain->u.file.filepath_name) + strlen(host_string) + 1;
-    if (NULL == (host_header = (char *)RV_malloc(host_header_len)))
-        FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTALLOC, FAIL, "can't allocate space for request Host header");
+        request_body_len = strlen(fmt_string) + strlen(escaped_obj_path) + 1;
 
-    strcpy(host_header, host_string);
+        if ((request_body = RV_malloc(request_body_len)) == NULL)
+            FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTALLOC, FAIL, "can't allocate space for path request body");
 
-    curl_headers =
-        curl_slist_append(curl_headers, strncat(host_header, parent_obj->domain->u.file.filepath_name,
-                                                host_header_len - strlen(host_string) - 1));
+        if ((bytes_printed = snprintf(request_body, request_body_len, fmt_string, escaped_obj_path)) < 0)
+            FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL, "snprintf error");
 
-    /* Disable use of Expect: 100 Continue HTTP response */
-    curl_headers = curl_slist_append(curl_headers, "Expect:");
+        if (bytes_printed >= request_body_len)
+            FUNC_GOTO_ERROR(H5E_LINK, H5E_SYSERRSTR, FAIL,
+                            "request body size exceeded allocated buffer size");
 
-    if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_HTTPHEADER, curl_headers))
-        FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL HTTP headers: %s", curl_err_buf);
-    if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_HTTPGET, 1))
-        FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set up cURL to make HTTP GET request: %s",
-                        curl_err_buf);
+        if ((http_response = RV_curl_post(curl, &parent_obj->domain->u.file.server_info, request_endpoint,
+                                          parent_obj->domain->u.file.filepath_name, request_body,
+                                          (size_t)bytes_printed, CONTENT_TYPE_JSON)) < 0)
+            FUNC_GOTO_ERROR(H5E_OBJECT, H5E_CANTGET, FAIL,
+                            "internal failure while making POST request to server");
+    }
+    else {
 
-    if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_URL, request_url))
-        FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't set cURL request URL: %s", curl_err_buf);
+        if ((http_response = RV_curl_get(curl, &parent_obj->domain->u.file.server_info, request_endpoint,
+                                         parent_obj->domain->u.file.filepath_name, CONTENT_TYPE_JSON)) < 0)
+            FUNC_GOTO_ERROR(H5E_OBJECT, H5E_CANTGET, FAIL,
+                            "internal failure while making GET request to server");
+    }
 
-#ifdef RV_CONNECTOR_DEBUG
-    printf("   /**********************************\\\n");
-    printf("-> | Making GET request to the server |\n");
-    printf("   \\**********************************/\n\n");
-#endif
-
-    CURL_PERFORM(curl, H5E_LINK, H5E_PATH, FAIL);
-
-    if (CURLE_OK != curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_response))
-        FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTGET, FAIL, "can't get HTTP response code");
-
-    ret_value = HTTP_SUCCESS(http_response);
+    if (HTTP_SUCCESS(http_response))
+        ret_value = TRUE;
+    else
+        HANDLE_RESPONSE(http_response, H5E_ATTR, H5E_CANTGET, FAIL);
 
 #ifdef RV_CONNECTOR_DEBUG
     printf("-> Object %s\n\n", ret_value ? "found" : "not found");
 #endif
 
-    /* Clean up the cURL headers to prevent issues in potential recursive call */
-    curl_slist_free_all(curl_headers);
-    curl_headers = NULL;
-
     if (SERVER_VERSION_MATCHES_OR_EXCEEDS(version, 0, 8, 0)) {
 
-        if (0 > RV_parse_response(response_buffer.buffer, NULL, target_object_type, RV_parse_type))
+        if (0 > RV_parse_response(response_buffer.buffer, NULL, target_object_type, RV_parse_object_class))
             FUNC_GOTO_ERROR(H5E_OBJECT, H5E_CANTGET, FAIL, "failed to get type from URI");
     }
     else {
@@ -2264,14 +2334,20 @@ RV_find_object_by_path(RV_object_t *parent_obj, const char *obj_path, H5I_type_t
                        H5L_TYPE_SOFT == link_info.type ? "soft" : "external");
 #endif
 
-                if (RV_parse_response(response_buffer.buffer, &link_val_len, NULL, RV_get_link_val_callback) <
-                    0)
+                get_link_val_out get_link_val_args;
+                get_link_val_args.in_buf_size = &link_val_len;
+                get_link_val_args.buf         = NULL;
+
+                if (RV_parse_response(response_buffer.buffer, NULL, &get_link_val_args,
+                                      RV_get_link_val_callback) < 0)
                     FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTGET, FAIL, "can't retrieve size of link's value");
 
                 if (NULL == (tmp_link_val = RV_malloc(link_val_len)))
                     FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTALLOC, FAIL, "can't allocate space for link's value");
 
-                if (RV_parse_response(response_buffer.buffer, &link_val_len, tmp_link_val,
+                get_link_val_args.buf = tmp_link_val;
+
+                if (RV_parse_response(response_buffer.buffer, NULL, &get_link_val_args,
                                       RV_get_link_val_callback) < 0)
                     FUNC_GOTO_ERROR(H5E_LINK, H5E_CANTGET, FAIL, "can't retrieve link's value");
 
@@ -2317,23 +2393,24 @@ RV_find_object_by_path(RV_object_t *parent_obj, const char *obj_path, H5I_type_t
 done:
     if (tmp_link_val)
         RV_free(tmp_link_val);
-    if (host_header)
-        RV_free(host_header);
     if (url_encoded_path_name)
         RV_free(url_encoded_path_name);
     if (url_encoded_link_name)
         curl_free(url_encoded_link_name);
     if (path_dirname)
         RV_free(path_dirname);
+    if (escaped_obj_path)
+        RV_free(escaped_obj_path);
+    if (request_body)
+        RV_free(request_body);
+
+    /* Necessary to prevent curl from potentially accessing freed buffers in subsequent calls */
+    if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_POST, 0))
+        FUNC_DONE_ERROR(H5E_LINK, H5E_CANTSET, FAIL, "can't unset cURL HTTP POST request: %s", curl_err_buf);
 
     if (external_file)
         if (RV_file_close(external_file, H5P_DEFAULT, NULL) < 0)
             FUNC_DONE_ERROR(H5E_LINK, H5E_CANTCLOSEOBJ, FAIL, "can't close file referenced by external link");
-
-    if (curl_headers) {
-        curl_slist_free_all(curl_headers);
-        curl_headers = NULL;
-    } /* end if */
 
     return ret_value;
 } /* end RV_find_object_by_path */
@@ -2411,13 +2488,14 @@ done:
  *              May, 2023
  */
 herr_t
-RV_copy_object_loc_info_callback(char *HTTP_response, void *callback_data_in, void *callback_data_out)
+RV_copy_object_loc_info_callback(char *HTTP_response, const void *callback_data_in, void *callback_data_out)
 {
-    yajl_val       parse_tree = NULL, key_obj;
-    char          *parsed_string;
-    loc_info      *loc_info_out = (loc_info *)callback_data_out;
-    server_info_t *server_info  = (server_info_t *)callback_data_in;
-    herr_t         ret_value    = SUCCEED;
+    yajl_val             parse_tree = NULL, key_obj = NULL, target_tree = NULL;
+    char                *parsed_string = NULL;
+    const char          *path_name     = NULL;
+    loc_info            *loc_info_out  = (loc_info *)callback_data_out;
+    const server_info_t *server_info   = (const server_info_t *)callback_data_in;
+    herr_t               ret_value     = SUCCEED;
 
     char *GCPL_buf = NULL;
 
@@ -2440,10 +2518,27 @@ RV_copy_object_loc_info_callback(char *HTTP_response, void *callback_data_in, vo
     if (NULL == (parse_tree = yajl_tree_parse(HTTP_response, NULL, 0)))
         FUNC_GOTO_ERROR(H5E_OBJECT, H5E_PARSEERROR, FAIL, "parsing JSON failed");
 
+    target_tree = parse_tree;
+
+    /* If the response contains 'h5paths',
+     * it may describe multiple objects. Needs to be unwrapped first. */
+    if (NULL != yajl_tree_get(parse_tree, h5paths_keys, yajl_t_object)) {
+        if (NULL == (target_tree = yajl_tree_get(parse_tree, h5paths_keys, yajl_t_object)))
+            FUNC_GOTO_ERROR(H5E_OBJECT, H5E_PARSEERROR, FAIL, "can't parse h5paths object");
+
+        /* Access the first object under h5paths */
+        if (NULL == (path_name = target_tree->u.object.keys[0]))
+            FUNC_GOTO_ERROR(H5E_OBJECT, H5E_PARSEERROR, FAIL, "parsed path name was NULL");
+
+        const char *path_keys[] = {path_name, (const char *)0};
+
+        if (NULL == (target_tree = yajl_tree_get(target_tree, path_keys, yajl_t_object)))
+            FUNC_GOTO_ERROR(H5E_OBJECT, H5E_PARSEERROR, FAIL, "unable to parse object under path key");
+    }
     /* Not all objects have a creationProperties field, so fail this gracefully */
     H5E_BEGIN_TRY
     {
-        RV_parse_creation_properties_callback(parse_tree, &GCPL_buf);
+        RV_parse_creation_properties_callback(target_tree, &GCPL_buf);
     }
     H5E_END_TRY
 
@@ -2452,7 +2547,7 @@ RV_copy_object_loc_info_callback(char *HTTP_response, void *callback_data_in, vo
     }
 
     /* Retrieve domain path */
-    if (NULL == (key_obj = yajl_tree_get(parse_tree, domain_keys, yajl_t_string)))
+    if (NULL == (key_obj = yajl_tree_get(target_tree, domain_keys, yajl_t_string)))
         FUNC_GOTO_ERROR(H5E_OBJECT, H5E_BADVALUE, FAIL, "failed to parse domain");
 
     if (!YAJL_IS_STRING(key_obj))
@@ -2462,7 +2557,7 @@ RV_copy_object_loc_info_callback(char *HTTP_response, void *callback_data_in, vo
         FUNC_GOTO_ERROR(H5E_OBJECT, H5E_BADVALUE, FAIL, "domain was NULL");
 
     /* Retrieve domain id */
-    if (NULL == (key_obj = yajl_tree_get(parse_tree, root_id_keys, yajl_t_string)))
+    if (NULL == (key_obj = yajl_tree_get(target_tree, root_id_keys, yajl_t_string)))
         FUNC_GOTO_ERROR(H5E_OBJECT, H5E_BADVALUE, FAIL, "failed to parse domain id");
 
     if (!YAJL_IS_STRING(key_obj))
@@ -2483,7 +2578,7 @@ RV_copy_object_loc_info_callback(char *HTTP_response, void *callback_data_in, vo
     /* If retrieved domain is different than the domain through which this object
      * was accessed, replace the returned object's domain. */
     if (is_external_domain) {
-        if (NULL == (new_domain = RV_malloc(sizeof(RV_object_t))))
+        if (NULL == (new_domain = RV_calloc(sizeof(RV_object_t))))
             FUNC_GOTO_ERROR(H5E_CALLBACK, H5E_CANTALLOC, FAIL, "failed to allocate memory for new domain");
 
         memcpy(new_domain, &found_domain, sizeof(RV_object_t));
@@ -2548,6 +2643,15 @@ done:
         RV_free(GCPL_buf);
         GCPL_buf                  = NULL;
         loc_info_out->GCPL_base64 = NULL;
+
+        if (new_domain) {
+            RV_free(new_domain->u.file.filepath_name);
+            RV_free(new_domain->u.file.server_info.username);
+            RV_free(new_domain->u.file.server_info.password);
+            RV_free(new_domain->u.file.server_info.base_URL);
+            RV_free(new_domain->handle_path);
+            RV_free(new_domain);
+        }
     }
 
     return ret_value;
@@ -2566,16 +2670,16 @@ done:
  *              May, 2023
  */
 herr_t
-RV_copy_link_name_by_index(char *HTTP_response, void *callback_data_in, void *callback_data_out)
+RV_copy_link_name_by_index(char *HTTP_response, const void *callback_data_in, void *callback_data_out)
 {
-    yajl_val           parse_tree = NULL, key_obj = NULL, link_obj = NULL;
-    const char        *parsed_link_name   = NULL;
-    char              *parsed_link_buffer = NULL;
-    H5VL_loc_by_idx_t *idx_params         = (H5VL_loc_by_idx_t *)callback_data_in;
-    hsize_t            index              = 0;
-    char             **link_name          = (char **)callback_data_out;
-    const char        *curr_key           = NULL;
-    herr_t             ret_value          = SUCCEED;
+    yajl_val                 parse_tree = NULL, key_obj = NULL, link_obj = NULL;
+    const char              *parsed_link_name   = NULL;
+    char                    *parsed_link_buffer = NULL;
+    const H5VL_loc_by_idx_t *idx_params         = (const H5VL_loc_by_idx_t *)callback_data_in;
+    hsize_t                  index              = 0;
+    char                   **link_name          = (char **)callback_data_out;
+    const char              *curr_key           = NULL;
+    herr_t                   ret_value          = SUCCEED;
 
     if (!idx_params)
         FUNC_GOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "given index params ptr was NULL");
@@ -2662,15 +2766,15 @@ done:
  *              May, 2023
  */
 herr_t
-RV_copy_attribute_name_by_index(char *HTTP_response, void *callback_data_in, void *callback_data_out)
+RV_copy_attribute_name_by_index(char *HTTP_response, const void *callback_data_in, void *callback_data_out)
 {
-    yajl_val           parse_tree           = NULL, key_obj;
-    const char        *parsed_string        = NULL;
-    char              *parsed_string_buffer = NULL;
-    H5VL_loc_by_idx_t *idx_params           = (H5VL_loc_by_idx_t *)callback_data_in;
-    hsize_t            index                = 0;
-    char             **attr_name            = (char **)callback_data_out;
-    herr_t             ret_value            = SUCCEED;
+    yajl_val                 parse_tree           = NULL, key_obj;
+    const char              *parsed_string        = NULL;
+    char                    *parsed_string_buffer = NULL;
+    const H5VL_loc_by_idx_t *idx_params           = (const H5VL_loc_by_idx_t *)callback_data_in;
+    hsize_t                  index                = 0;
+    char                   **attr_name            = (char **)callback_data_out;
+    herr_t                   ret_value            = SUCCEED;
 
     if (!attr_name)
         FUNC_GOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "given attr_name was NULL");
@@ -2750,12 +2854,13 @@ done:
 hid_t
 RV_parse_dataspace(char *space)
 {
-    yajl_val parse_tree = NULL, key_obj = NULL;
-    hsize_t *space_dims     = NULL;
-    hsize_t *space_maxdims  = NULL;
-    hid_t    dataspace      = FAIL;
-    char    *dataspace_type = NULL;
-    hid_t    ret_value      = FAIL;
+    yajl_val    parse_tree = NULL, key_obj = NULL, target_tree = NULL;
+    hsize_t    *space_dims     = NULL;
+    hsize_t    *space_maxdims  = NULL;
+    hid_t       dataspace      = FAIL;
+    char       *dataspace_type = NULL;
+    const char *path_name      = NULL;
+    hid_t       ret_value      = FAIL;
 
 #ifdef RV_CONNECTOR_DEBUG
     printf("-> Parsing dataspace from HTTP response\n\n");
@@ -2767,8 +2872,28 @@ RV_parse_dataspace(char *space)
     if (NULL == (parse_tree = yajl_tree_parse(space, NULL, 0)))
         FUNC_GOTO_ERROR(H5E_DATASPACE, H5E_PARSEERROR, FAIL, "JSON parse tree creation failed");
 
+    target_tree = parse_tree;
+
+    /* If the response contains 'h5paths',
+     * it may describe multiple objects. Needs to be unwrapped first. */
+    if (NULL != yajl_tree_get(parse_tree, h5paths_keys, yajl_t_object)) {
+        if (NULL == (key_obj = yajl_tree_get(parse_tree, h5paths_keys, yajl_t_object)))
+            FUNC_GOTO_ERROR(H5E_OBJECT, H5E_PARSEERROR, FAIL, "can't parse h5paths object");
+
+        /* Access the first object under h5paths */
+        if (NULL == (path_name = key_obj->u.object.keys[0]))
+            FUNC_GOTO_ERROR(H5E_OBJECT, H5E_PARSEERROR, FAIL, "parsed path name was NULL");
+
+        const char *path_keys[] = {path_name, (const char *)0};
+
+        if (NULL == (key_obj = yajl_tree_get(key_obj, path_keys, yajl_t_object)))
+            FUNC_GOTO_ERROR(H5E_OBJECT, H5E_PARSEERROR, FAIL, "unable to parse object under path key");
+
+        target_tree = key_obj;
+    }
+
     /* Retrieve the Dataspace type */
-    if (NULL == (key_obj = yajl_tree_get(parse_tree, dataspace_class_keys, yajl_t_string)))
+    if (NULL == (key_obj = yajl_tree_get(target_tree, dataspace_class_keys, yajl_t_string)))
         FUNC_GOTO_ERROR(H5E_DATASPACE, H5E_PARSEERROR, FAIL, "can't retrieve dataspace class");
 
     if (NULL == (dataspace_type = YAJL_GET_STRING(key_obj)))
@@ -2800,13 +2925,13 @@ RV_parse_dataspace(char *space)
         printf("-> SIMPLE dataspace\n\n");
 #endif
 
-        if (NULL == (dims_obj = yajl_tree_get(parse_tree, dataspace_dims_keys, yajl_t_array)))
+        if (NULL == (dims_obj = yajl_tree_get(target_tree, dataspace_dims_keys, yajl_t_array)))
             FUNC_GOTO_ERROR(H5E_DATASPACE, H5E_PARSEERROR, FAIL, "can't retrieve dataspace dims");
 
         /* Check to see whether the maximum dimension size is specified as part of the
          * dataspace's JSON representation
          */
-        if (NULL == (maxdims_obj = yajl_tree_get(parse_tree, dataspace_max_dims_keys, yajl_t_array)))
+        if (NULL == (maxdims_obj = yajl_tree_get(target_tree, dataspace_max_dims_keys, yajl_t_array)))
             maxdims_specified = FALSE;
 
         if (!YAJL_GET_ARRAY(dims_obj)->len)
@@ -3327,7 +3452,7 @@ done:
 
 /* Helper function to store the version of the external HSDS server */
 herr_t
-RV_parse_server_version(char *HTTP_response, void *callback_data_in, void *callback_data_out)
+RV_parse_server_version(char *HTTP_response, const void *callback_data_in, void *callback_data_out)
 {
     yajl_val            parse_tree     = NULL, key_obj;
     herr_t              ret_value      = SUCCEED;
@@ -3393,9 +3518,9 @@ done:
     return ret_value;
 }
 
-/* Helper function to parse an object's allocated size from server response */
+/* Helper function to parse a non-domain object's allocated size from server response */
 herr_t
-RV_parse_allocated_size_callback(char *HTTP_response, void *callback_data_in, void *callback_data_out)
+RV_parse_allocated_size_cb(char *HTTP_response, void *callback_data_in, void *callback_data_out)
 {
     yajl_val parse_tree = NULL, key_obj = NULL;
     herr_t   ret_value      = SUCCEED;
@@ -3511,10 +3636,7 @@ done:
 }
 
 herr_t
-RV_curl_multi_perform(CURL *curl_multi_handle, dataset_transfer_info *transfer_info, size_t count,
-                      herr_t(success_callback)(hid_t mem_type_id, hid_t mem_space_id, hid_t file_type_id,
-                                               hid_t file_space_id, void *buf,
-                                               struct response_buffer resp_buffer))
+RV_curl_multi_perform(CURL *curl_multi_handle, dataset_transfer_info *transfer_info, size_t count)
 {
 
     herr_t         ret_value               = SUCCEED;
@@ -3643,13 +3765,24 @@ RV_curl_multi_perform(CURL *curl_multi_handle, dataset_transfer_info *transfer_i
                         FUNC_GOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL,
                                         "can't get handle information for retry");
 
-                    if (success_callback(
-                            transfer_info[handle_index].mem_type_id, transfer_info[handle_index].mem_space_id,
-                            transfer_info[handle_index].file_type_id,
-                            transfer_info[handle_index].file_space_id, transfer_info[handle_index].buf,
-                            transfer_info[handle_index].resp_buffer) < 0)
-                        FUNC_GOTO_ERROR(H5E_DATASET, H5E_READERROR, FAIL,
-                                        "failed to post-process data read from dataset");
+                    switch (transfer_info[handle_index].transfer_type) {
+                        case (READ):
+                            if (RV_dataset_read_cb(transfer_info[handle_index].mem_type_id,
+                                                   transfer_info[handle_index].mem_space_id,
+                                                   transfer_info[handle_index].file_type_id,
+                                                   transfer_info[handle_index].file_space_id,
+                                                   transfer_info[handle_index].u.read_info.buf,
+                                                   transfer_info[handle_index].resp_buffer) < 0)
+                                FUNC_GOTO_ERROR(H5E_DATASET, H5E_READERROR, FAIL,
+                                                "failed to post-process data read from dataset");
+                            break;
+                        case (WRITE):
+                            /* No post-processing necessary */
+                            break;
+                        case (UNINIT):
+                            FUNC_GOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL, "invalid transfer type");
+                            break;
+                    }
 
                     /* Clean up */
                     if (CURLM_OK != curl_multi_remove_handle(curl_multi_handle, curl_multi_msg->easy_handle))
@@ -3844,6 +3977,9 @@ RV_JSON_escape_string(const char *in, char *out, size_t *out_size)
     char *out_ptr                                  = NULL;
     char  escape_characters[NUM_JSON_ESCAPE_CHARS] = {'\b', '\f', '\n', '\r', '\t', '\"', '\\'};
 
+    if (!in)
+        FUNC_GOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "cannot JSON escape NULL string");
+
     if (out == NULL) {
         /* Determine necessary buffer size */
         *out_size = in_size + 1;
@@ -3899,3 +4035,414 @@ done:
 
     return ret_value;
 }
+
+/* Helper function to perform a DELETE request to an endpoint on a server.
+ * Request endpoint must contain a leading slash. */
+long
+RV_curl_delete(CURL *curl_handle, server_info_t *server_info, const char *request_endpoint,
+               const char *filename)
+{
+    long   ret_value       = FAIL;
+    size_t host_header_len = 0;
+
+    char              *host_header = NULL;
+    char               request_url[URL_MAX_LENGTH];
+    int                url_len            = 0;
+    struct curl_slist *curl_headers_local = NULL;
+
+    /* Setup the host header */
+    host_header_len = strlen(filename) + strlen(host_string) + 1;
+
+    if (NULL == (host_header = (char *)RV_malloc(host_header_len)))
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_CANTALLOC, FAIL, "can't allocate space for request Host header");
+
+    strcpy(host_header, host_string);
+
+    curl_headers_local = curl_slist_append(
+        curl_headers_local, strncat(host_header, filename, host_header_len - strlen(host_string) - 1));
+
+    /* Disable use of Expect: 100 Continue HTTP response */
+    curl_headers_local = curl_slist_append(curl_headers_local, "Expect:");
+
+    if (CURLE_OK != curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, curl_headers_local))
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_CANTSET, FAIL, "can't set cURL HTTP headers: %s", curl_err_buf);
+
+    /* Assemble request url */
+    if ((url_len = snprintf(request_url, URL_MAX_LENGTH, "%s%s", server_info->base_URL, request_endpoint)) <
+        0)
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_BADVALUE, FAIL, "snprintf error");
+
+    if (url_len >= URL_MAX_LENGTH)
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_SYSERRSTR, FAIL,
+                        "H5Adelete(_by_name) request URL exceeded maximum URL size");
+
+    if (CURLE_OK != curl_easy_setopt(curl_handle, CURLOPT_URL, request_url))
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_CANTSET, FAIL, "can't set cURL request URL: %s", curl_err_buf);
+
+    /* Make DELETE request */
+    if (CURLE_OK != curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, "DELETE"))
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_CANTSET, FAIL, "can't set up cURL to make HTTP DELETE request: %s",
+                        curl_err_buf);
+#ifdef RV_CONNECTOR_DEBUG
+    printf("-> Deleting object at URL: %s\n\n", request_url);
+
+    printf("   /*************************************\\\n");
+    printf("-> | Making DELETE request to the server |\n");
+    printf("   \\*************************************/\n\n");
+#endif
+
+    CURL_PERFORM_NO_ERR(curl_handle, FAIL);
+
+    if (CURLE_OK != curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &ret_value))
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_CANTGET, ret_value, "can't get HTTP response code");
+
+done:
+
+    /* Reset custom request */
+    if (CURLE_OK != curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, NULL))
+        FUNC_DONE_ERROR(H5E_INTERNAL, H5E_CANTSET, FAIL, "can't reset cURL custom request: %s", curl_err_buf);
+
+    if (host_header)
+        RV_free(host_header);
+
+    if (curl_headers_local) {
+        curl_slist_free_all(curl_headers_local);
+        curl_headers_local = NULL;
+    }
+
+    return ret_value;
+}
+
+/* Helper function to perform a PUT request to an endpoint on a server.
+ * Request endpoint must contain a leading slash. */
+long
+RV_curl_put(CURL *curl_handle, server_info_t *server_info, const char *request_endpoint, const char *filename,
+            upload_info *uinfo, content_type_t content_type)
+{
+    long   ret_value       = FAIL;
+    size_t host_header_len = 0;
+
+    char              *host_header = NULL;
+    char               request_url[URL_MAX_LENGTH];
+    int                url_len            = 0;
+    struct curl_slist *curl_headers_local = NULL;
+
+    /* Setup the host header */
+    host_header_len = strlen(filename) + strlen(host_string) + 1;
+    if (NULL == (host_header = (char *)RV_malloc(host_header_len)))
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_CANTALLOC, FAIL, "can't allocate space for request Host header");
+
+    strcpy(host_header, host_string);
+
+    curl_headers_local = curl_slist_append(
+        curl_headers_local, strncat(host_header, filename, host_header_len - strlen(host_string) - 1));
+
+    /* Disable use of Expect: 100 Continue HTTP response */
+    curl_headers_local = curl_slist_append(curl_headers_local, "Expect:");
+
+    /* Specify type of content being sent through cURL */
+    switch (content_type) {
+        case CONTENT_TYPE_JSON:
+            curl_headers_local = curl_slist_append(curl_headers_local, "Content-Type: application/json");
+            break;
+        case CONTENT_TYPE_OCTET_STREAM:
+            curl_headers_local =
+                curl_slist_append(curl_headers_local, "Content-Type: application/octet-stream");
+            break;
+        case CONTENT_TYPE_UNINIT:
+            FUNC_GOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "content type of transfer is unspecified");
+            break;
+    }
+
+    /* Assemble request url */
+    if ((url_len = snprintf(request_url, URL_MAX_LENGTH, "%s%s", server_info->base_URL, request_endpoint)) <
+        0)
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_BADVALUE, FAIL, "snprintf error");
+
+    if (url_len >= URL_MAX_LENGTH)
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_SYSERRSTR, FAIL,
+                        "H5Adelete(_by_name) request URL exceeded maximum URL size");
+
+    if (CURLE_OK != curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, curl_headers_local))
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_CANTSET, FAIL, "can't set cURL HTTP headers: %s", curl_err_buf);
+    if (CURLE_OK != curl_easy_setopt(curl_handle, CURLOPT_UPLOAD, 1))
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_CANTSET, FAIL, "can't set up cURL to make HTTP PUT request: %s",
+                        curl_err_buf);
+
+    /* Provide information for upload */
+    if (uinfo) {
+        if (CURLE_OK != curl_easy_setopt(curl_handle, CURLOPT_READDATA, uinfo))
+            FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_CANTSET, FAIL, "can't set cURL PUT data: %s", curl_err_buf);
+        if (CURLE_OK !=
+            curl_easy_setopt(curl_handle, CURLOPT_INFILESIZE_LARGE, (curl_off_t)uinfo->buffer_size))
+            FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_CANTSET, FAIL, "can't set cURL PUT data size: %s",
+                            curl_err_buf);
+    }
+    else {
+        if (CURLE_OK != curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)0))
+            FUNC_GOTO_ERROR(H5E_FILE, H5E_CANTSET, FAIL, "can't set cURL upload size: %s", curl_err_buf);
+    }
+
+    if (CURLE_OK != curl_easy_setopt(curl_handle, CURLOPT_URL, request_url))
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_CANTSET, FAIL, "can't set cURL request URL: %s", curl_err_buf);
+
+#ifdef RV_CONNECTOR_DEBUG
+    printf("   /**********************************\\\n");
+    printf("-> | Making PUT request to the server |\n");
+    printf("   \\**********************************/\n\n");
+#endif
+
+    CURL_PERFORM_NO_ERR(curl_handle, FAIL);
+
+    if (CURLE_OK != curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &ret_value))
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_CANTGET, ret_value, "can't get HTTP response code");
+
+done:
+
+    if (CURLE_OK != curl_easy_setopt(curl_handle, CURLOPT_UPLOAD, 0))
+        FUNC_DONE_ERROR(H5E_INTERNAL, H5E_CANTSET, FAIL, "can't unset cURL PUT option: %s", curl_err_buf);
+
+    if (host_header)
+        RV_free(host_header);
+
+    if (curl_headers_local) {
+        curl_slist_free_all(curl_headers_local);
+        curl_headers_local = NULL;
+    }
+
+    return ret_value;
+}
+
+/* Helper function to perform a GET request to an endpoint on a server.
+ * Request endpoint must contain a leading slash. */
+long
+RV_curl_get(CURL *curl_handle, server_info_t *server_info, const char *request_endpoint, const char *filename,
+            content_type_t content_type)
+{
+    herr_t ret_value       = FAIL;
+    size_t host_header_len = 0;
+
+    char              *host_header = NULL;
+    char               request_url[URL_MAX_LENGTH];
+    int                url_len            = 0;
+    struct curl_slist *curl_headers_local = NULL;
+
+    /* Setup the host header */
+    host_header_len = strlen(filename) + strlen(host_string) + 1;
+    if (NULL == (host_header = (char *)RV_malloc(host_header_len)))
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_CANTALLOC, FAIL, "can't allocate space for request Host header");
+
+    strcpy(host_header, host_string);
+
+    curl_headers_local = curl_slist_append(
+        curl_headers_local, strncat(host_header, filename, host_header_len - strlen(host_string) - 1));
+
+    /* Specify type of content being sent through cURL */
+    switch (content_type) {
+        case CONTENT_TYPE_JSON:
+            curl_headers_local = curl_slist_append(curl_headers_local, "Accept: application/json");
+            break;
+        case CONTENT_TYPE_OCTET_STREAM:
+            curl_headers_local = curl_slist_append(curl_headers_local, "Accept: application/octet-stream");
+            break;
+        case CONTENT_TYPE_UNINIT:
+            FUNC_GOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "content type of transfer is unspecified");
+            break;
+    }
+
+    /* Disable use of Expect: 100 Continue HTTP response */
+    curl_headers_local = curl_slist_append(curl_headers_local, "Expect:");
+
+    /* Assemble request url */
+    if ((url_len = snprintf(request_url, URL_MAX_LENGTH, "%s%s", server_info->base_URL, request_endpoint)) <
+        0)
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_BADVALUE, FAIL, "snprintf error");
+
+    if (url_len >= URL_MAX_LENGTH)
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_SYSERRSTR, FAIL, "cURL GET request URL exceeded maximum URL size");
+
+    if (CURLE_OK != curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, curl_headers_local))
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_CANTSET, FAIL, "can't set cURL HTTP headers: %s", curl_err_buf);
+    if (CURLE_OK != curl_easy_setopt(curl_handle, CURLOPT_HTTPGET, 1))
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_CANTSET, FAIL, "can't set up cURL to make HTTP PUT request: %s",
+                        curl_err_buf);
+
+    if (CURLE_OK != curl_easy_setopt(curl_handle, CURLOPT_URL, request_url))
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_CANTSET, FAIL, "can't set cURL request URL: %s", curl_err_buf);
+
+#ifdef RV_CONNECTOR_DEBUG
+    printf("   /**********************************\\\n");
+    printf("-> | Making GET request to the server |\n");
+    printf("   \\**********************************/\n\n");
+#endif
+
+    CURL_PERFORM_NO_ERR(curl_handle, FAIL);
+
+    if (CURLE_OK != curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &ret_value))
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_CANTGET, FAIL, "can't get HTTP response code");
+
+done:
+
+    if (CURLE_OK != curl_easy_setopt(curl_handle, CURLOPT_HTTPGET, 0))
+        FUNC_DONE_ERROR(H5E_INTERNAL, H5E_CANTSET, FAIL, "can't set up cURL to make HTTP PUT request: %s",
+                        curl_err_buf);
+
+    if (host_header)
+        RV_free(host_header);
+
+    if (curl_headers_local) {
+        curl_slist_free_all(curl_headers_local);
+        curl_headers_local = NULL;
+    }
+
+    return ret_value;
+}
+
+/* Helper function to perform a POST request to an endpoint on a server.
+ * Request endpoint must contain a leading slash. */
+long
+RV_curl_post(CURL *curl_handle, server_info_t *server_info, const char *request_endpoint,
+             const char *filename, const char *post_data, size_t data_size, content_type_t content_type)
+{
+    herr_t ret_value       = FAIL;
+    size_t host_header_len = 0;
+
+    char              *host_header = NULL;
+    char               request_url[URL_MAX_LENGTH];
+    int                url_len            = 0;
+    struct curl_slist *curl_headers_local = NULL;
+    curl_off_t         _data_size;
+
+    /* Setup the host header */
+    host_header_len = strlen(filename) + strlen(host_string) + 1;
+    if (NULL == (host_header = (char *)RV_malloc(host_header_len)))
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_CANTALLOC, FAIL, "can't allocate space for request Host header");
+
+    strcpy(host_header, host_string);
+
+    curl_headers_local = curl_slist_append(
+        curl_headers_local, strncat(host_header, filename, host_header_len - strlen(host_string) - 1));
+
+    /* Specify type of content being sent through cURL */
+    switch (content_type) {
+        case CONTENT_TYPE_JSON:
+            curl_headers_local = curl_slist_append(curl_headers_local, "Accept: application/json");
+            break;
+        case CONTENT_TYPE_OCTET_STREAM:
+            curl_headers_local = curl_slist_append(curl_headers_local, "Accept: application/octet-stream");
+            break;
+        case CONTENT_TYPE_UNINIT:
+            FUNC_GOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "content type of transfer is unspecified");
+            break;
+    }
+
+    /* Disable use of Expect: 100 Continue HTTP response */
+    curl_headers_local = curl_slist_append(curl_headers_local, "Expect:");
+
+    /* Assemble request url */
+    if ((url_len = snprintf(request_url, URL_MAX_LENGTH, "%s%s", server_info->base_URL, request_endpoint)) <
+        0)
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_BADVALUE, FAIL, "snprintf error");
+
+    if (url_len >= URL_MAX_LENGTH)
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_SYSERRSTR, FAIL, "cURL GET request URL exceeded maximum URL size");
+
+    if (CURLE_OK != curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, curl_headers_local))
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_CANTSET, FAIL, "can't set cURL HTTP headers: %s", curl_err_buf);
+    if (CURLE_OK != curl_easy_setopt(curl_handle, CURLOPT_POST, 1))
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_CANTSET, FAIL, "can't set up cURL to make HTTP POST request: %s",
+                        curl_err_buf);
+    if (CURLE_OK != curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, post_data))
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_CANTSET, FAIL, "can't set cURL POST data: %s", curl_err_buf);
+
+    /* Make sure that the size of the create request HTTP body can safely be cast to a curl_off_t */
+    if (sizeof(curl_off_t) < sizeof(size_t))
+        ASSIGN_TO_SMALLER_SIZE(_data_size, curl_off_t, data_size, size_t)
+    else if (sizeof(curl_off_t) > sizeof(size_t))
+        _data_size = (curl_off_t)data_size;
+    else
+        ASSIGN_TO_SAME_SIZE_UNSIGNED_TO_SIGNED(_data_size, curl_off_t, data_size, size_t)
+
+    if (CURLE_OK != curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDSIZE_LARGE, _data_size))
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_CANTSET, FAIL, "can't set cURL POST data size: %s", curl_err_buf);
+
+    if (CURLE_OK != curl_easy_setopt(curl_handle, CURLOPT_URL, request_url))
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_CANTSET, FAIL, "can't set cURL request URL: %s", curl_err_buf);
+
+#ifdef RV_CONNECTOR_DEBUG
+    printf("   /**********************************\\\n");
+    printf("-> | Making POST request to the server |\n");
+    printf("   \\**********************************/\n\n");
+#endif
+
+    CURL_PERFORM_NO_ERR(curl_handle, FAIL);
+
+    if (CURLE_OK != curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &ret_value))
+        FUNC_GOTO_ERROR(H5E_INTERNAL, H5E_CANTGET, ret_value, "can't get HTTP response code");
+
+done:
+
+    if (CURLE_OK != curl_easy_setopt(curl_handle, CURLOPT_POST, 0))
+        FUNC_DONE_ERROR(H5E_INTERNAL, H5E_CANTSET, FAIL, "can't unset cURL POST request: %s", curl_err_buf);
+
+    if (host_header)
+        RV_free(host_header);
+
+    if (curl_headers_local) {
+        curl_slist_free_all(curl_headers_local);
+        curl_headers_local = NULL;
+    }
+
+    return ret_value;
+}
+/*-------------------------------------------------------------------------
+ * Function:    RV_parse_domain_allocated_size_cb
+ *
+ * Purpose:     Given an HSDS response containing scan information about a
+ *              domain, retrieves the allocated_byte values and modifies
+ *              callback_data_out to point to it. HSDS returns scan info
+ *              on a domain request with the 'verbose' parameter
+ *
+ * Return:      Non-negative on success/Negative on failure
+ *
+ * Programmer:  Matthew Larson
+ *              January, 2024
+ */
+herr_t
+RV_parse_domain_allocated_size_cb(char *HTTP_response, const void *callback_data_in, void *callback_data_out)
+{
+    yajl_val parse_tree = NULL, key_obj;
+    char    *parsed_object_string;
+    size_t  *filesize  = (size_t *)callback_data_out;
+    herr_t   ret_value = SUCCEED;
+
+#ifdef RV_CONNECTOR_DEBUG
+    printf("-> Retrieving filesize from server's HTTP response\n\n");
+#endif
+
+    if (!HTTP_response)
+        FUNC_GOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "HTTP response buffer was NULL");
+    if (!filesize)
+        FUNC_GOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "output pointer was NULL");
+
+    if (NULL == (parse_tree = yajl_tree_parse(HTTP_response, NULL, 0)))
+        FUNC_GOTO_ERROR(H5E_CALLBACK, H5E_PARSEERROR, FAIL, "parsing JSON failed");
+
+    if (NULL == (key_obj = yajl_tree_get(parse_tree, scan_info_keys, yajl_t_object)))
+        FUNC_GOTO_ERROR(H5E_CALLBACK, H5E_PARSEERROR, FAIL, "couldn't get scan info");
+
+    if (NULL == (key_obj = yajl_tree_get(key_obj, allocated_bytes_keys, yajl_t_number))) {
+        FUNC_GOTO_ERROR(H5E_CALLBACK, H5E_PARSEERROR, FAIL, "couldn't parse allocated bytes");
+    }
+
+    if (YAJL_GET_INTEGER(key_obj) < 0)
+        FUNC_GOTO_ERROR(H5E_CALLBACK, H5E_PARSEERROR, FAIL, "parsed filesize is negative");
+
+    *filesize = (size_t)YAJL_GET_INTEGER(key_obj);
+
+done:
+    if (parse_tree)
+        yajl_tree_free(parse_tree);
+
+    return ret_value;
+} /* end RV_parse_domain_allocated_size_cb */
